@@ -166,8 +166,86 @@ function journalTable(rows) {
   );
 }
 
+// ---- manual equity Trade ticket (symbol/side/qty/type/price/tif) ----
+function tradeTicket(snap, armed) {
+  const opts = (snap.order_types || [])
+    .map((o) => `<option value="${esc(o.key)}">${esc(o.label)}</option>`)
+    .join("");
+  return (
+    `<section><h2>Trade — manual equity / ETF order</h2>` +
+    `<div class="ticket">` +
+    `<label>Symbol <input id="trade-symbol" class="t-sym" placeholder="AAPL" autocomplete="off" spellcheck="false"/></label>` +
+    `<label>Side <select id="trade-side"><option value="BUY">Buy</option><option value="SELL">Sell</option></select></label>` +
+    `<label>Qty <input id="trade-qty" type="number" min="1" step="1" value="1" class="t-qty"/></label>` +
+    `<label>Type <select id="trade-type">${opts}</select></label>` +
+    `<label>Price <input id="trade-price" type="number" min="0" step="0.05" value="0" class="t-px"/></label>` +
+    `<label>TIF <select id="trade-tif"><option value="DAY">Day</option><option value="GTC">GTC</option></select></label>` +
+    `<button class="mini" data-act="trade-preview">Preview</button>` +
+    `<button class="mini exec" data-act="trade-execute"${armed ? "" : " disabled"}>Execute</button>` +
+    `</div>` +
+    `<div class="ticket-note dim">Marketable / MidPrice / Adaptive price off the live book — leave Price at 0. ` +
+    `Market is protected (no naked market). Execute needs Arm + not read-only.</div>` +
+    `</section>`
+  );
+}
+
+function orderStatusTag(s) {
+  const l = String(s).toLowerCase();
+  if (l === "filled") return "tag ok";
+  if (l.includes("cancel") || l === "inactive" || l === "apicancelled") return "tag bad";
+  return "tag work";
+}
+function ordersTable(snap) {
+  if (!snap.orders_ok)
+    return `<div class="empty">${snap.connected ? "orders unknown — last fetch failed (Refresh)" : "offline"}</div>`;
+  const rows = snap.orders || [];
+  if (!rows.length) return `<div class="empty">no working orders</div>`;
+  const body = rows
+    .map(
+      (o) =>
+        `<tr><td>${esc(o.symbol)}</td><td>${esc(o.side)}</td><td class="num">${o.quantity}</td>` +
+        `<td>${esc(o.order_type)}</td><td class="num">${price(o.limit_price)}</td>` +
+        `<td><span class="${orderStatusTag(o.status)}">${esc(o.status)}</span></td>` +
+        `<td class="num">${o.filled}/${o.filled + o.remaining}</td>` +
+        `<td class="acts"><button class="mini bad" data-act="cancel" data-id="${esc(o.id)}">Cancel</button></td></tr>`
+    )
+    .join("");
+  return (
+    `<table><thead><tr><th>Symbol</th><th>Side</th><th class="num">Qty</th><th>Type</th>` +
+    `<th class="num">Limit</th><th>Status</th><th class="num">Filled</th><th></th></tr></thead><tbody>${body}</tbody></table>`
+  );
+}
+
+function portfolioTable(snap) {
+  if (!snap.portfolio_ok)
+    return `<div class="empty">${snap.connected ? "portfolio unknown — last fetch failed (Refresh)" : "offline"}</div>`;
+  const rows = snap.portfolio || [];
+  if (!rows.length) return `<div class="empty">no open positions</div>`;
+  const pnl = (v) => `<td class="num ${v >= 0 ? "pos" : "neg"}">${v >= 0 ? "+" : ""}${Math.round(v)}</td>`;
+  const body = rows
+    .map(
+      (p) =>
+        `<tr><td>${esc(p.symbol)}</td><td>${esc(p.security_type)}</td><td class="num">${p.position}</td>` +
+        `<td class="num">${price(p.market_price)}</td><td class="num">${money(p.market_value)}</td>` +
+        `<td class="num">${price(p.average_cost)}</td>${pnl(p.unrealized_pnl)}${pnl(p.realized_pnl)}</tr>`
+    )
+    .join("");
+  return (
+    `<table><thead><tr><th>Symbol</th><th>Type</th><th class="num">Qty</th><th class="num">Mark</th>` +
+    `<th class="num">Value</th><th class="num">Avg cost</th><th class="num">Unrl P&amp;L</th>` +
+    `<th class="num">Real P&amp;L</th></tr></thead><tbody>${body}</tbody></table>`
+  );
+}
+
+// Field ids whose half-typed values must survive the 3s heartbeat re-render.
+const KEEP_IDS = ["live-phrase", "trade-symbol", "trade-side", "trade-qty", "trade-type", "trade-price", "trade-tif"];
+
 function render(snap) {
-  const liveVal = (document.getElementById("live-phrase") || {}).value || "";
+  const keep = {};
+  KEEP_IDS.forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) keep[id] = el.value;
+  });
   const armed = snap.armed;
   const note = snap.note ? `<div class="note">${esc(snap.note)}</div>` : "";
   const armedBanner = armed
@@ -183,14 +261,19 @@ function render(snap) {
     (snap.status ? `<div class="statusline">${esc(snap.status)}</div>` : "") +
     armedBanner +
     note +
+    tradeTicket(snap, armed) +
     `<section><h2>0DTE structures</h2><div class="grid">${grid}</div></section>` +
     `<section><h2>Suggestions — cash-secured puts</h2>${suggestionTable(snap.suggestions, "classic", armed)}</section>` +
     hedged +
-    `<section><h2>Positions</h2>${positionsTable(snap.positions)}</section>` +
+    `<section><h2>Orders — working</h2>${ordersTable(snap)}</section>` +
+    `<section><h2>Portfolio — positions &amp; P&amp;L</h2>${portfolioTable(snap)}</section>` +
+    `<section><h2>Wheel positions</h2>${positionsTable(snap.positions)}</section>` +
     `<section><h2>Journal</h2>${journalTable(snap.journal)}</section>`;
-  // Preserve a half-typed live-confirm phrase across re-renders.
-  const lp = document.getElementById("live-phrase");
-  if (lp) lp.value = liveVal;
+  // Restore half-typed inputs (live-confirm + Trade ticket) across re-renders.
+  Object.entries(keep).forEach(([id, v]) => {
+    const el = document.getElementById(id);
+    if (el && v !== "" && v != null) el.value = v;
+  });
 }
 
 // ---- command wiring (one delegated listener; survives re-renders) ----
@@ -212,6 +295,18 @@ document.addEventListener("click", (e) => {
   else if (act === "confirm-live") {
     const p = (document.getElementById("live-phrase") || {}).value || "";
     call("confirm_live", { phrase: p });
+  } else if (act === "trade-preview" || act === "trade-execute") {
+    const v = (id, d) => (document.getElementById(id) || {}).value || d;
+    call(act === "trade-preview" ? "trade_preview" : "trade_execute", {
+      symbol: v("trade-symbol", ""),
+      side: v("trade-side", "BUY"),
+      qty: +v("trade-qty", "1"),
+      otype: v("trade-type", "marketable"),
+      price: +v("trade-price", "0"),
+      tif: v("trade-tif", "DAY"),
+    });
+  } else if (act === "cancel") {
+    call("cancel_order", { id: b.dataset.id });
   }
 });
 

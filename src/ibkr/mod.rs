@@ -13,8 +13,9 @@ use anyhow::{anyhow, Result};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-use ibapi::accounts::types::AccountGroup;
+use ibapi::accounts::types::{AccountGroup, AccountId};
 use ibapi::contracts::{LegAction, OptionChain, OptionComputation};
+use ibapi::market_data::realtime::TickType as TT;
 use ibapi::orders::{OrderBuilder, Orders};
 // Re-exported (not a fresh `ibapi` import elsewhere): the what-if `OrderState` is
 // already surfaced through `OrderOutcome::Preview`, so callers may name it.
@@ -74,6 +75,56 @@ fn round_to_tick(price: f64, tick: f64) -> f64 {
         return price;
     }
     (price / tick).round() * tick
+}
+
+/// What a [`Ibkr::collect_snapshot`] caller is waiting for, so it can stop as
+/// soon as it has that and not wait out the full timeout: a tradeable `Price`
+/// (last), a two-sided `Quote` (bid+ask, for marketable-limit pricing), or
+/// option `Greeks` (the delta/IV computation).
+#[derive(Clone, Copy)]
+enum SnapshotGoal {
+    Price,
+    Quote,
+    Greeks,
+}
+
+/// Route an incoming price tick into the snapshot by its tick type. Bid/ask
+/// (realtime or delayed) populate the two-sided quote; every other price tick
+/// (last, close, the option-specific ticks) feeds `last` — preserving the prior
+/// "any price → last" behavior while now also capturing bid/ask for equities.
+fn apply_price_tick(data: &mut SnapshotData, tt: TT, price: f64) {
+    match tt {
+        TT::Bid | TT::DelayedBid => data.bid = Some(price),
+        TT::Ask | TT::DelayedAsk => data.ask = Some(price),
+        _ => data.last = Some(price),
+    }
+}
+
+/// Compute an **immediately-marketable** limit price: cross to the opposite side
+/// of the book (ask for a buy, bid for a sell), nudge by `slack_ticks`, and round
+/// to `tick`. Fills now like a market order but with a hard worst-case cap.
+///
+/// Returns `None` — caller must refuse to submit, never silently fall back to a
+/// market order — when the quote is unusable: a missing/non-positive side, a
+/// crossed/locked book (`ask < bid`), or an absurdly wide spread (> 50% of mid
+/// and more than a few ticks), which is the stale-quote / fat-finger guard.
+pub fn marketable_limit(side: Side, bid: f64, ask: f64, tick: f64, slack_ticks: u32) -> Option<f64> {
+    if !bid.is_finite() || !ask.is_finite() || bid <= 0.0 || ask <= 0.0 || ask < bid {
+        return None;
+    }
+    let mid = (bid + ask) / 2.0;
+    let spread = ask - bid;
+    let tick = if tick > 0.0 { tick } else { 0.01 };
+    if mid > 0.0 && spread > 0.5 * mid && spread > 4.0 * tick {
+        return None;
+    }
+    let slack = slack_ticks as f64 * tick;
+    let raw = match side {
+        Side::Buy => ask + slack,
+        // Never price a sell at or below zero, even with a huge slack.
+        Side::Sell => (bid - slack).max(tick),
+    };
+    Some(round_to_tick(raw, tick))
 }
 
 /// The shared preview-or-submit tail for every order path (single-leg, spread,
@@ -216,6 +267,47 @@ impl Ibkr {
         }
     }
 
+    /// Live valuation of every position in `account` — mark, market value, and
+    /// unrealized/realized P&L — for the Portfolio view, from the account-update
+    /// stream (`reqAccountUpdates`). Collects the initial download (terminated by
+    /// the `End` marker), then drops the subscription to stop the feed.
+    ///
+    /// Like [`Self::positions`], returns `Err` on an incomplete read (stream error
+    /// or timeout before `End`) so the caller treats it as "unknown" rather than
+    /// "the account is empty".
+    pub async fn account_portfolio(&self, account: &str) -> Result<Vec<PortfolioRow>> {
+        use ibapi::accounts::AccountUpdate;
+        let acct = AccountId::from(account);
+        let mut sub = self
+            .client
+            .account_updates(&acct)
+            .await
+            .map_err(|e| anyhow!("account_updates {account}: {e}"))?;
+
+        let mut rows = Vec::new();
+        let outcome = timeout(Duration::from_secs(10), async {
+            while let Some(item) = sub.next().await {
+                match item {
+                    // Skip fully-closed rows the feed still reports (position 0).
+                    Ok(AccountUpdate::PortfolioValue(p)) if p.position != 0.0 => {
+                        rows.push(PortfolioRow::from(&p))
+                    }
+                    Ok(AccountUpdate::End) => return Ok(()),
+                    Ok(_) => {} // AccountValue / UpdateTime — not needed here
+                    Err(e) => return Err(anyhow!("account_updates stream error: {e}")),
+                }
+            }
+            Err(anyhow!("account_updates stream ended before End"))
+        })
+        .await;
+        // Dropping `sub` cancels the subscription (reqAccountUpdates false).
+        match outcome {
+            Ok(Ok(())) => Ok(rows),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(anyhow!("account_updates request timed out")),
+        }
+    }
+
     /// Snapshot of this client's currently open orders (id + underlying symbol).
     ///
     /// Authoritative "what's working right now": used to suppress stacking a
@@ -240,8 +332,25 @@ impl Ibkr {
                     Some(Ok(Orders::OrderData(d))) => out.push(OpenOrderInfo {
                         order_id: d.order_id.to_string(),
                         symbol: d.contract.symbol.to_string(),
+                        action: format!("{:?}", d.order.action).to_uppercase(),
+                        quantity: d.order.total_quantity,
+                        order_type: d.order.order_type.clone(),
+                        limit_price: d.order.limit_price,
+                        status: d.order_state.status.clone(),
+                        filled: 0.0,
+                        remaining: d.order.total_quantity,
                     }),
-                    Some(Ok(_)) => {} // OrderStatus / Notice — not needed here
+                    // A status row in the same snapshot carries live fill progress;
+                    // merge it into the order it belongs to (keyed by id).
+                    Some(Ok(Orders::OrderStatus(s))) => {
+                        let id = s.order_id.to_string();
+                        if let Some(o) = out.iter_mut().find(|o| o.order_id == id) {
+                            o.status = s.status.clone();
+                            o.filled = s.filled;
+                            o.remaining = s.remaining;
+                        }
+                    }
+                    Some(Ok(_)) => {} // Notice — not needed here
                     Some(Err(e)) => return Err(anyhow!("open_orders stream error: {e}")),
                     None => return Ok(()), // clean end (OpenOrderEnd)
                 }
@@ -356,14 +465,23 @@ impl Ibkr {
         // 100=option volume, 101=option open interest, 106=implied vol/greeks.
         // 18s (not 10): free *delayed* greeks can take well over 10s to compute,
         // and dropping them leaves the engine with no in-band quote to rank.
-        self.collect_snapshot(&contract, &["100", "101", "106"], Duration::from_secs(18))
+        self.collect_snapshot(&contract, &["100", "101", "106"], SnapshotGoal::Greeks, Duration::from_secs(18))
             .await
     }
 
     /// Snapshot the underlying's price (index-aware, like the contract resolver).
     pub async fn underlying_snapshot(&self, symbol: &str) -> Result<SnapshotData> {
         let contract = underlying_contract(symbol);
-        self.collect_snapshot(&contract, &[], Duration::from_secs(8))
+        self.collect_snapshot(&contract, &[], SnapshotGoal::Price, Duration::from_secs(8))
+            .await
+    }
+
+    /// Two-sided quote (bid/ask/last) for an equity/ETF — what the manual Trade
+    /// ticket prices a marketable limit off of. Index-aware via the shared
+    /// contract resolver; waits for both sides before returning.
+    pub async fn equity_quote(&self, symbol: &str) -> Result<SnapshotData> {
+        let contract = underlying_contract(symbol);
+        self.collect_snapshot(&contract, &[], SnapshotGoal::Quote, Duration::from_secs(8))
             .await
     }
 
@@ -420,6 +538,46 @@ impl Ibkr {
             Side::Sell => builder.sell(order.quantity),
         };
         let ready = sided.limit(order.limit).day_order();
+        finish_order(ready, preview, order).await
+    }
+
+    /// Submit (transmit) or preview (what-if) a **plain equity/ETF order** — the
+    /// manual Trade ticket's entry point. Mirrors [`Self::submit_or_preview`] so
+    /// preview and execute can't drift: both flow through [`finish_order`], which
+    /// owns the what-if timeout, the read-only behavior, and id formatting.
+    ///
+    /// The [`EquityOrderKind`] selects the order type: a (marketable or plain)
+    /// limit, a midpoint-seeking `MIDPRICE`, a protected market, or the IBKR
+    /// `Adaptive` algo wrapping a limit base. Prices are rounded to the equity
+    /// tick. There is deliberately **no naked market** order type.
+    pub async fn submit_or_preview_equity(
+        &self,
+        order: &EquityOrder<'_>,
+        preview: bool,
+    ) -> Result<OrderOutcome> {
+        if order.quantity <= 0 {
+            return Err(anyhow!("equity order {}: quantity must be > 0", order.symbol));
+        }
+        let contract = Contract::stock(order.symbol).build();
+        let tick = order_tick(order.symbol);
+        let builder = self.client.order(&contract);
+        let sided = match order.side {
+            Side::Buy => builder.buy(order.quantity),
+            Side::Sell => builder.sell(order.quantity),
+        };
+        let typed = match order.kind {
+            EquityOrderKind::Limit(px) => sided.limit(round_to_tick(px, tick)),
+            EquityOrderKind::MidPrice(cap) => sided.midprice(cap.map(|c| round_to_tick(c, tick))),
+            EquityOrderKind::Market => sided.market_with_protection(),
+            EquityOrderKind::Adaptive { limit, priority } => sided
+                .limit(round_to_tick(limit, tick))
+                .algo("Adaptive")
+                .algo_param("adaptivePriority", priority.as_str()),
+        };
+        let ready = match order.tif {
+            Tif::Day => typed.day_order(),
+            Tif::Gtc => typed.good_till_cancel(),
+        };
         finish_order(ready, preview, order).await
     }
 
@@ -637,6 +795,7 @@ impl Ibkr {
         &self,
         contract: &Contract,
         generic_ticks: &[&str],
+        goal: SnapshotGoal,
         wait: Duration,
     ) -> Result<SnapshotData> {
         let wants_greeks = !generic_ticks.is_empty();
@@ -652,10 +811,14 @@ impl Ibkr {
         let _ = timeout(wait, async {
             while let Some(item) = sub.next().await {
                 match item {
-                    // We match generically on price so this works under both
-                    // realtime and delayed tick types.
-                    Ok(TickTypes::Price(p)) if p.price > 0.0 => data.last = Some(p.price),
-                    Ok(TickTypes::PriceSize(ps)) if ps.price > 0.0 => data.last = Some(ps.price),
+                    // Route by tick type so bid/ask land separately from last;
+                    // works under both realtime and delayed tick types.
+                    Ok(TickTypes::Price(p)) if p.price > 0.0 => {
+                        apply_price_tick(&mut data, p.tick_type, p.price)
+                    }
+                    Ok(TickTypes::PriceSize(ps)) if ps.price > 0.0 => {
+                        apply_price_tick(&mut data, ps.price_tick_type, ps.price)
+                    }
                     Ok(TickTypes::OptionComputation(c)) => {
                         if c.delta.is_some() || c.implied_volatility.is_some() {
                             data.comp = Some(c);
@@ -670,9 +833,12 @@ impl Ibkr {
                     }
                 }
                 // Streaming has no end marker — stop as soon as we have what we
-                // came for (a computation for greeks, else a price) instead of
-                // waiting out the full timeout on every contract.
-                let enough = if wants_greeks { data.comp.is_some() } else { data.last.is_some() };
+                // came for instead of waiting out the full timeout per contract.
+                let enough = match goal {
+                    SnapshotGoal::Greeks => data.comp.is_some(),
+                    SnapshotGoal::Price => data.last.is_some(),
+                    SnapshotGoal::Quote => data.bid.is_some() && data.ask.is_some(),
+                };
                 if enough {
                     break;
                 }
@@ -785,8 +951,21 @@ impl From<OptionChain> for ChainMeta {
 #[derive(Debug, Default)]
 pub struct SnapshotData {
     pub last: Option<f64>,
+    pub bid: Option<f64>,
+    pub ask: Option<f64>,
     pub comp: Option<OptionComputation>,
     pub notices: Vec<String>,
+}
+
+impl SnapshotData {
+    /// Midpoint of the two-sided quote when both sides are present and sane,
+    /// else the last trade. `None` if neither is available.
+    pub fn mid(&self) -> Option<f64> {
+        match (self.bid, self.ask) {
+            (Some(b), Some(a)) if a >= b && b > 0.0 => Some((a + b) / 2.0),
+            _ => self.last,
+        }
+    }
 }
 
 /// Whether the account may trade a given underlying's options.
@@ -838,6 +1017,80 @@ impl std::fmt::Display for OptionOrder<'_> {
             "{} {}x {} {:.1}{} {} @{:.2}",
             self.side, self.quantity, self.symbol, self.strike, self.right, self.expiry_yyyymmdd, self.limit
         )
+    }
+}
+
+/// Time-in-force for a manual equity order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tif {
+    /// Cancel at the end of the regular session.
+    Day,
+    /// Good-till-cancelled (rests across sessions until filled or pulled).
+    Gtc,
+}
+
+/// Urgency knob for the IBKR `Adaptive` algo (`adaptivePriority`): patient gives
+/// the algo more time to seek price improvement; urgent crosses sooner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdaptivePriority {
+    Patient,
+    Normal,
+    Urgent,
+}
+
+impl AdaptivePriority {
+    fn as_str(self) -> &'static str {
+        match self {
+            AdaptivePriority::Patient => "Patient",
+            AdaptivePriority::Normal => "Normal",
+            AdaptivePriority::Urgent => "Urgent",
+        }
+    }
+}
+
+/// How a manual equity order is priced and routed. Deliberately offers **no
+/// naked market** — [`EquityOrderKind::Market`] maps to *market-with-protection*.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EquityOrderKind {
+    /// A limit order at this price. Carries both the "marketable limit" (price
+    /// computed from the live book via [`marketable_limit`]) and "plain limit"
+    /// (price the user typed) UI choices — they differ only in price source.
+    Limit(f64),
+    /// Midpoint-seeking (`MIDPRICE`) with an optional worst-case price cap.
+    MidPrice(Option<f64>),
+    /// Market with protection (no unbounded market order).
+    Market,
+    /// IBKR `Adaptive` algo wrapping a limit base at `limit`, at `priority`.
+    Adaptive { limit: f64, priority: AdaptivePriority },
+}
+
+/// A manual equity/ETF order request (preview or live). Borrows its symbol so a
+/// caller can build one cheaply from form state.
+#[derive(Debug, Clone, Copy)]
+pub struct EquityOrder<'a> {
+    pub symbol: &'a str,
+    pub side: Side,
+    pub quantity: i32,
+    pub kind: EquityOrderKind,
+    pub tif: Tif,
+}
+
+impl std::fmt::Display for EquityOrder<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match self.kind {
+            EquityOrderKind::Limit(p) => format!("LMT @{p:.2}"),
+            EquityOrderKind::MidPrice(Some(c)) => format!("MIDPRICE cap {c:.2}"),
+            EquityOrderKind::MidPrice(None) => "MIDPRICE".to_string(),
+            EquityOrderKind::Market => "MKT-PROT".to_string(),
+            EquityOrderKind::Adaptive { limit, priority } => {
+                format!("ADAPTIVE/{} @{limit:.2}", priority.as_str())
+            }
+        };
+        let tif = match self.tif {
+            Tif::Day => "DAY",
+            Tif::Gtc => "GTC",
+        };
+        write!(f, "{} {}x {} {kind} {tif}", self.side, self.quantity, self.symbol)
     }
 }
 
@@ -913,11 +1166,53 @@ impl std::fmt::Display for ComboOrder<'_> {
     }
 }
 
-/// One of the account's currently open orders (id + underlying symbol).
+/// One of the account's currently open orders. Carries enough to both suppress
+/// stacking (id + symbol) and render a working-orders panel (side, size, type,
+/// limit, status, fill progress).
 #[derive(Debug, Clone)]
 pub struct OpenOrderInfo {
     pub order_id: String,
     pub symbol: String,
+    /// `"BUY"` / `"SELL"` (IBKR action, upper-cased).
+    pub action: String,
+    pub quantity: f64,
+    /// IBKR order-type string, e.g. `"LMT"`, `"MKT"`, `"MIDPRICE"`.
+    pub order_type: String,
+    pub limit_price: Option<f64>,
+    /// IBKR order status, e.g. `"Submitted"`, `"PreSubmitted"`, `"PendingCancel"`.
+    pub status: String,
+    pub filled: f64,
+    pub remaining: f64,
+}
+
+/// A position's live valuation for the Portfolio view (from the account-update
+/// stream): mark, market value, average cost, and unrealized/realized P&L.
+#[derive(Debug, Clone)]
+pub struct PortfolioRow {
+    pub symbol: String,
+    /// Debug spelling of the `ibapi` security type, e.g. `"Stock"` / `"Option"`.
+    pub security_type: String,
+    pub position: f64,
+    pub market_price: f64,
+    pub market_value: f64,
+    pub average_cost: f64,
+    pub unrealized_pnl: f64,
+    pub realized_pnl: f64,
+}
+
+impl From<&ibapi::accounts::AccountPortfolioValue> for PortfolioRow {
+    fn from(p: &ibapi::accounts::AccountPortfolioValue) -> Self {
+        Self {
+            symbol: p.contract.symbol.to_string(),
+            security_type: format!("{:?}", p.contract.security_type),
+            position: p.position,
+            market_price: p.market_price,
+            market_value: p.market_value,
+            average_cost: p.average_cost,
+            unrealized_pnl: p.unrealized_pnl,
+            realized_pnl: p.realized_pnl,
+        }
+    }
 }
 
 /// A plain, broker-agnostic order-activity event mapped from `ibapi`'s
@@ -993,8 +1288,53 @@ pub enum OrderOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::{connect_failure_hint, notice_is_noise};
+    use super::{connect_failure_hint, marketable_limit, notice_is_noise, Side};
     use anyhow::anyhow;
+
+    fn approx(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn marketable_limit_crosses_the_spread() {
+        // Buy crosses to the ask (+ slack); sell crosses to the bid (− slack).
+        let buy = marketable_limit(Side::Buy, 1.00, 1.10, 0.01, 0).unwrap();
+        assert!(approx(buy, 1.10), "buy at ask, got {buy}");
+        let buy_slack = marketable_limit(Side::Buy, 1.00, 1.10, 0.01, 5).unwrap();
+        assert!(approx(buy_slack, 1.15), "buy ask+5t, got {buy_slack}");
+        let sell = marketable_limit(Side::Sell, 1.00, 1.10, 0.01, 0).unwrap();
+        assert!(approx(sell, 1.00), "sell at bid, got {sell}");
+        let sell_slack = marketable_limit(Side::Sell, 1.00, 1.10, 0.01, 3).unwrap();
+        assert!(approx(sell_slack, 0.97), "sell bid−3t, got {sell_slack}");
+    }
+
+    #[test]
+    fn marketable_limit_rounds_to_tick() {
+        // $0.05 index grid: ask 4.02 + 0 slack rounds to 4.00.
+        let p = marketable_limit(Side::Buy, 3.95, 4.02, 0.05, 0).unwrap();
+        assert!(approx(p, 4.00), "rounded to tick, got {p}");
+    }
+
+    #[test]
+    fn marketable_limit_refuses_unusable_quotes() {
+        // Missing/zero side, crossed/locked book, and absurd spreads → None,
+        // so the caller never silently submits a market order.
+        assert!(marketable_limit(Side::Buy, 0.0, 1.10, 0.01, 0).is_none());
+        assert!(marketable_limit(Side::Buy, 1.00, 0.0, 0.01, 0).is_none());
+        assert!(marketable_limit(Side::Buy, 1.20, 1.10, 0.01, 0).is_none(), "crossed");
+        assert!(marketable_limit(Side::Sell, f64::NAN, 1.10, 0.01, 0).is_none());
+        // Spread > 50% of mid and > 4 ticks: 1.00/3.00 (mid 2.0, spread 2.0).
+        assert!(marketable_limit(Side::Buy, 1.00, 3.00, 0.01, 0).is_none(), "absurd spread");
+        // A wide-but-sane spread still prices.
+        assert!(marketable_limit(Side::Buy, 1.00, 1.20, 0.01, 0).is_some());
+    }
+
+    #[test]
+    fn marketable_limit_sell_never_negative() {
+        // A huge slack on a thin book must not price a sell at or below zero.
+        let p = marketable_limit(Side::Sell, 0.05, 0.06, 0.01, 100).unwrap();
+        assert!(p >= 0.01, "sell floored at a tick, got {p}");
+    }
 
     #[test]
     fn notice_noise_filters_only_benign_codes() {

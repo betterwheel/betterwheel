@@ -36,6 +36,7 @@ hedge_min_credit = 0.10   # Hedged Wheel: skip put spreads with net credit below
 [guardrails]
 max_total_deployed = 50000.0   # hard ceiling on TOTAL short-put collateral (open positions + new entry)
 max_contracts_per_order = 10
+max_order_notional = 10000.0   # hard ceiling on a single manual equity order (price x shares) on the Trade tab
 require_live_confirmation = true  # in live mode, type LIVE (press `L`) to unlock transmits each session
 read_only = false                 # true disables all order transmits (incl. auto profit-close / roll-open)
 

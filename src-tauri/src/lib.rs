@@ -20,9 +20,9 @@ use tokio::task::JoinHandle;
 use betterwheel::config::{Config, ConnectionConfig};
 use betterwheel::engine::structures;
 use betterwheel::engine::types::{ActionKind, StructureLeg, Suggestion};
-use betterwheel::ibkr::{AccountSnapshot, Ibkr, OrderEvent};
+use betterwheel::ibkr::{AccountSnapshot, Ibkr, OpenOrderInfo, OrderEvent, PortfolioRow, Side, Tif};
 use betterwheel::store::{JournalRow, Store, WheelPositionRow};
-use betterwheel::tui::app::{App, BrokerUpdate, SugList};
+use betterwheel::tui::app::{App, BrokerUpdate, SugList, TradeOrderType};
 
 const RECONNECT_SECS: u64 = 15;
 const HEALTH_SECS: u64 = 5;
@@ -62,6 +62,60 @@ struct JournalView {
     strike: Option<f64>,
     quantity: i64,
     status: String,
+}
+
+#[derive(Serialize, Clone)]
+struct OrderView {
+    id: String,
+    symbol: String,
+    side: String,
+    quantity: f64,
+    order_type: String,
+    limit_price: Option<f64>,
+    status: String,
+    filled: f64,
+    remaining: f64,
+}
+impl From<&OpenOrderInfo> for OrderView {
+    fn from(o: &OpenOrderInfo) -> Self {
+        Self {
+            id: o.order_id.clone(),
+            symbol: o.symbol.clone(),
+            side: o.action.clone(),
+            quantity: o.quantity,
+            order_type: o.order_type.clone(),
+            limit_price: o.limit_price,
+            status: o.status.clone(),
+            filled: o.filled,
+            remaining: o.remaining,
+        }
+    }
+}
+
+#[derive(Serialize, Clone)]
+struct PortfolioView {
+    symbol: String,
+    security_type: String,
+    position: f64,
+    market_price: f64,
+    market_value: f64,
+    average_cost: f64,
+    unrealized_pnl: f64,
+    realized_pnl: f64,
+}
+impl From<&PortfolioRow> for PortfolioView {
+    fn from(p: &PortfolioRow) -> Self {
+        Self {
+            symbol: p.symbol.clone(),
+            security_type: p.security_type.clone(),
+            position: p.position,
+            market_price: p.market_price,
+            market_value: p.market_value,
+            average_cost: p.average_cost,
+            unrealized_pnl: p.unrealized_pnl,
+            realized_pnl: p.realized_pnl,
+        }
+    }
 }
 
 /// A suggestion flattened for the webview: a ready display label + the scalar
@@ -128,9 +182,24 @@ struct Snapshot {
     zerodte: Vec<SlotView>,
     positions: Vec<PositionView>,
     journal: Vec<JournalView>,
+    orders: Vec<OrderView>,
+    /// `false` when the last open-orders fetch was incomplete ("unknown").
+    orders_ok: bool,
+    portfolio: Vec<PortfolioView>,
+    /// `false` when the last portfolio fetch was incomplete ("unknown").
+    portfolio_ok: bool,
+    /// The equity tick's order-type choices, so the frontend's select stays in
+    /// sync with the backend `TradeOrderType` without hardcoding it.
+    order_types: Vec<OrderTypeOption>,
     status: String,
     updated: String,
     note: String,
+}
+
+#[derive(Serialize, Clone)]
+struct OrderTypeOption {
+    key: String,
+    label: String,
 }
 
 /// Sample a structure's expiry P&L (total $ for `qty` contracts) across a price
@@ -228,6 +297,14 @@ fn build_snapshot(app: &App) -> Snapshot {
         zerodte: slot_views(&app.cfg, &app.zerodte_suggestions),
         positions: app.positions.iter().filter(|p| p.state != "Idle").map(pos_view).collect(),
         journal: app.journal.iter().map(jrn_view).collect(),
+        orders: app.open_orders.iter().map(OrderView::from).collect(),
+        orders_ok: app.open_orders_ok,
+        portfolio: app.portfolio.iter().map(PortfolioView::from).collect(),
+        portfolio_ok: app.portfolio_ok,
+        order_types: TradeOrderType::ALL
+            .iter()
+            .map(|t| OrderTypeOption { key: t.key().to_string(), label: t.label().to_string() })
+            .collect(),
         status: app.status.clone(),
         updated: Local::now().format("%H:%M:%S").to_string(),
         note: if app.connected {
@@ -478,6 +555,89 @@ async fn refresh(
     Ok(emit(&app_handle, &state).await)
 }
 
+/// Parse the frontend's order-ticket fields and load them onto the `App`'s Trade
+/// form. Strict — an unrecognized side / type / TIF is rejected, not defaulted.
+fn load_trade(
+    app: &mut App,
+    symbol: String,
+    side: &str,
+    qty: i32,
+    otype: &str,
+    price: f64,
+    tif: &str,
+) -> Result<(), String> {
+    let side = match side.to_ascii_uppercase().as_str() {
+        "BUY" => Side::Buy,
+        "SELL" => Side::Sell,
+        other => return Err(format!("bad side {other}")),
+    };
+    let otype = TradeOrderType::from_key(&otype.to_ascii_lowercase())
+        .ok_or_else(|| format!("bad order type {otype}"))?;
+    let tif = match tif.to_ascii_uppercase().as_str() {
+        "DAY" => Tif::Day,
+        "GTC" => Tif::Gtc,
+        other => return Err(format!("bad tif {other}")),
+    };
+    app.ui_set_trade(symbol, side, qty, otype, price, tif);
+    Ok(())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn trade_preview(
+    symbol: String,
+    side: String,
+    qty: i32,
+    otype: String,
+    price: f64,
+    tif: String,
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, Shared>,
+) -> Result<Snapshot, String> {
+    {
+        let mut app = state.app.lock().await;
+        load_trade(&mut app, symbol, &side, qty, &otype, price, &tif)?;
+        app.ui_trade_preview(&state.store).await.map_err(|e| e.to_string())?;
+    }
+    Ok(emit(&app_handle, &state).await)
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn trade_execute(
+    symbol: String,
+    side: String,
+    qty: i32,
+    otype: String,
+    price: f64,
+    tif: String,
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, Shared>,
+) -> Result<Snapshot, String> {
+    {
+        let mut app = state.app.lock().await;
+        load_trade(&mut app, symbol, &side, qty, &otype, price, &tif)?;
+        app.ui_trade_execute(&state.store).await.map_err(|e| e.to_string())?;
+    }
+    Ok(emit(&app_handle, &state).await)
+}
+
+#[tauri::command]
+async fn cancel_order(
+    id: String,
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, Shared>,
+) -> Result<Snapshot, String> {
+    state
+        .app
+        .lock()
+        .await
+        .ui_cancel_order(&id, &state.store)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(emit(&app_handle, &state).await)
+}
+
 async fn try_connect(cfg: &Config) -> Option<Arc<Ibkr>> {
     match tokio::time::timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS), Ibkr::connect(&cfg.connection)).await {
         Ok(Ok(ib)) => {
@@ -532,7 +692,10 @@ pub fn run() {
             execute,
             set_armed,
             confirm_live,
-            refresh
+            refresh,
+            trade_preview,
+            trade_execute,
+            cancel_order
         ])
         .setup(|app| {
             let handle = app.handle().clone();
