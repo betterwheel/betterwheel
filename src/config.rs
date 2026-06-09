@@ -162,6 +162,9 @@ pub struct Guardrails {
     pub max_total_deployed: f64,
     /// Maximum contracts allowed on a single order.
     pub max_contracts_per_order: i32,
+    /// Maximum notional (price × shares) for a single manual equity order on the
+    /// Trade tab. Caps a fat-finger ticket independently of the option caps above.
+    pub max_order_notional: f64,
     /// Require typing a confirmation phrase before enabling live trading.
     pub require_live_confirmation: bool,
     /// When true, all order-transmit paths are disabled (preview only).
@@ -173,6 +176,7 @@ impl Default for Guardrails {
         Self {
             max_total_deployed: 50_000.0,
             max_contracts_per_order: 10,
+            max_order_notional: 10_000.0,
             require_live_confirmation: true,
             read_only: false,
         }

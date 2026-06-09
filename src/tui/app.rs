@@ -28,8 +28,9 @@ use crate::engine::types::{
     ActionKind, LegSide, Right, StructureKind, StructureLeg, Suggestion, WheelState,
 };
 use crate::ibkr::{
-    AccountSnapshot, ComboLeg, ComboOrder, Ibkr, OpenOrderInfo, OptionOrder, OrderEvent,
-    OrderOutcome, OrderState, PositionRow, Side, SpreadOrder,
+    marketable_limit, AccountSnapshot, AdaptivePriority, ComboLeg, ComboOrder, EquityOrder,
+    EquityOrderKind, Ibkr, OpenOrderInfo, OptionOrder, OrderEvent, OrderOutcome, OrderState,
+    PortfolioRow, PositionRow, Side, SpreadOrder, Tif,
 };
 use crate::positions;
 use crate::store::{
@@ -46,18 +47,27 @@ pub enum Tab {
     Suggestions,
     HedgedWheel,
     ZeroDte,
+    /// Manual equity/ETF order ticket (the Trade tab).
+    Trade,
+    /// Live working orders (with cancel).
+    Orders,
+    /// Live positions with mark + unrealized P&L.
+    Portfolio,
     Journal,
     Settings,
     Help,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 8] = [
+    pub const ALL: [Tab; 11] = [
         Tab::Dashboard,
         Tab::Watchlist,
         Tab::Suggestions,
         Tab::HedgedWheel,
         Tab::ZeroDte,
+        Tab::Trade,
+        Tab::Orders,
+        Tab::Portfolio,
         Tab::Journal,
         Tab::Settings,
         Tab::Help,
@@ -70,6 +80,9 @@ impl Tab {
             Tab::Suggestions => "Suggestions",
             Tab::HedgedWheel => "Hedged Wheel",
             Tab::ZeroDte => "0DTE",
+            Tab::Trade => "Trade",
+            Tab::Orders => "Orders",
+            Tab::Portfolio => "Portfolio",
             Tab::Journal => "Journal",
             Tab::Settings => "Settings",
             Tab::Help => "Help",
@@ -78,6 +91,154 @@ impl Tab {
 
     pub fn index(self) -> usize {
         Tab::ALL.iter().position(|t| *t == self).unwrap_or(0)
+    }
+}
+
+/// A cached two-sided quote for the Trade ticket (a `Clone` subset of the
+/// broker's `SnapshotData`, which isn't `Clone`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EquityQuote {
+    pub bid: Option<f64>,
+    pub ask: Option<f64>,
+    pub last: Option<f64>,
+}
+
+impl EquityQuote {
+    /// Midpoint when both sides are present and sane, else last.
+    pub fn mid(&self) -> Option<f64> {
+        match (self.bid, self.ask) {
+            (Some(b), Some(a)) if a >= b && b > 0.0 => Some((a + b) / 2.0),
+            _ => self.last,
+        }
+    }
+}
+
+/// The order-type choice on the Trade ticket. "Marketable" and "Limit" both
+/// place a limit order (they differ only in where the price comes from — the
+/// live book vs. the typed field); the rest map to their IBKR order types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TradeOrderType {
+    /// Cross the spread now at a capped price computed from the live quote.
+    Marketable,
+    /// Plain limit at the typed price.
+    Limit,
+    /// Midpoint-seeking (`MIDPRICE`); the typed price, if any, is the cap.
+    MidPrice,
+    /// Market-with-protection (no naked market).
+    Market,
+    /// IBKR `Adaptive` (Normal priority) over a limit base.
+    Adaptive,
+}
+
+impl TradeOrderType {
+    pub const ALL: [TradeOrderType; 5] = [
+        TradeOrderType::Marketable,
+        TradeOrderType::Limit,
+        TradeOrderType::MidPrice,
+        TradeOrderType::Market,
+        TradeOrderType::Adaptive,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TradeOrderType::Marketable => "Marketable limit",
+            TradeOrderType::Limit => "Limit",
+            TradeOrderType::MidPrice => "MidPrice",
+            TradeOrderType::Market => "Market (protected)",
+            TradeOrderType::Adaptive => "Adaptive",
+        }
+    }
+
+    fn cycle(self, delta: i32) -> Self {
+        let i = Self::ALL.iter().position(|t| *t == self).unwrap_or(0) as i32;
+        let n = Self::ALL.len() as i32;
+        Self::ALL[(i + delta).rem_euclid(n) as usize]
+    }
+
+    /// Parse a lower-case key (as the desktop frontend sends it).
+    pub fn from_key(s: &str) -> Option<Self> {
+        Some(match s {
+            "marketable" => Self::Marketable,
+            "limit" => Self::Limit,
+            "midprice" => Self::MidPrice,
+            "market" => Self::Market,
+            "adaptive" => Self::Adaptive,
+            _ => return None,
+        })
+    }
+
+    /// The lower-case key for this type (round-trips with [`Self::from_key`]).
+    pub fn key(self) -> &'static str {
+        match self {
+            TradeOrderType::Marketable => "marketable",
+            TradeOrderType::Limit => "limit",
+            TradeOrderType::MidPrice => "midprice",
+            TradeOrderType::Market => "market",
+            TradeOrderType::Adaptive => "adaptive",
+        }
+    }
+}
+
+/// The focused field on the Trade ticket (j/k move focus, h/l adjust).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TradeField {
+    Symbol,
+    Side,
+    Qty,
+    Type,
+    Price,
+    Tif,
+}
+
+impl TradeField {
+    pub const ALL: [TradeField; 6] = [
+        TradeField::Symbol,
+        TradeField::Side,
+        TradeField::Qty,
+        TradeField::Type,
+        TradeField::Price,
+        TradeField::Tif,
+    ];
+
+    fn cycle(self, delta: i32) -> Self {
+        let i = Self::ALL.iter().position(|t| *t == self).unwrap_or(0) as i32;
+        let n = Self::ALL.len() as i32;
+        Self::ALL[(i + delta).rem_euclid(n) as usize]
+    }
+}
+
+/// The Trade tab's order ticket — persistent form state (not a transient input
+/// mode). Symbol entry uses [`InputMode::TradeSymbol`]; every other field is
+/// adjusted in place with h/l on the focused row.
+#[derive(Debug, Clone)]
+pub struct TradeForm {
+    pub symbol: String,
+    pub side: Side,
+    pub qty: i32,
+    pub otype: TradeOrderType,
+    /// Typed limit / cap / Adaptive-base price (0.0 = unset).
+    pub price: f64,
+    /// Marketable-limit aggressiveness, in ticks through the touch.
+    pub slack_ticks: u32,
+    pub tif: Tif,
+    pub field: TradeField,
+    /// Last fetched quote for `symbol` (drives marketable pricing + the panel).
+    pub quote: Option<EquityQuote>,
+}
+
+impl Default for TradeForm {
+    fn default() -> Self {
+        Self {
+            symbol: String::new(),
+            side: Side::Buy,
+            qty: 1,
+            otype: TradeOrderType::Marketable,
+            price: 0.0,
+            slack_ticks: 1,
+            tif: Tif::Day,
+            field: TradeField::Symbol,
+            quote: None,
+        }
     }
 }
 
@@ -93,6 +254,8 @@ pub enum InputMode {
     AddSymbol(String),
     /// Typing the [`LIVE_CONFIRM_PHRASE`] to unlock live trading this session.
     ConfirmLive(String),
+    /// Typing the ticker for the Trade ticket's symbol field (holds the buffer).
+    TradeSymbol(String),
 }
 
 /// An intent produced by a keypress, applied by [`App::dispatch`].
@@ -129,6 +292,14 @@ pub enum Action {
     SlotRisk(i32),
     /// Adjust the focused 0DTE slot's profit target (`+1`/`-1` step).
     SlotProfit(i32),
+    /// Move focus between Trade-ticket fields (`+1` next, `-1` prev).
+    TradeField(i32),
+    /// Adjust the focused Trade-ticket field (`+1`/`-1` step).
+    TradeAdjust(i32),
+    /// Begin typing the Trade ticket's symbol.
+    TradeEditSymbol,
+    /// Cancel the working order selected on the Orders tab (guardrailed).
+    CancelOrder,
 }
 
 /// Which ranked list a desktop command addresses (the desktop has no tab state,
@@ -171,6 +342,17 @@ pub struct App {
     /// Live broker positions (populated only when connected).
     pub broker_positions: Vec<PositionRow>,
     pub account: Option<AccountSnapshot>,
+    /// Live working orders for the Orders tab (empty when offline/unknown).
+    pub open_orders: Vec<OpenOrderInfo>,
+    /// `false` when the last open-orders fetch was incomplete: the Orders tab
+    /// shows "unknown" rather than an empty (misleading) list.
+    pub open_orders_ok: bool,
+    /// Live position valuation (mark + P&L) for the Portfolio tab.
+    pub portfolio: Vec<PortfolioRow>,
+    /// `false` when the last portfolio fetch was incomplete (shown as "unknown").
+    pub portfolio_ok: bool,
+    /// The manual Trade-ticket form (always present; rendered on the Trade tab).
+    pub trade: TradeForm,
     pub selected: usize,
     pub input: InputMode,
     pub status: String,
@@ -296,6 +478,11 @@ impl App {
             positions: Vec::new(),
             broker_positions: Vec::new(),
             account: None,
+            open_orders: Vec::new(),
+            open_orders_ok: false,
+            portfolio: Vec::new(),
+            portfolio_ok: false,
+            trade: TradeForm::default(),
             selected: 0,
             input: InputMode::Normal,
             status: initial_status(connected),
@@ -363,6 +550,8 @@ impl App {
             Tab::Suggestions => self.suggestions.len(),
             Tab::HedgedWheel => self.hedged_suggestions.len(),
             Tab::ZeroDte => self.zerodte_suggestions.len(), // one entry per quadrant slot
+            Tab::Orders => self.open_orders.len(),
+            Tab::Portfolio => self.portfolio.len(),
             Tab::Journal => self.journal.len(),
             Tab::Settings => 2, // win-rate row + take-profit row
             _ => 0,
@@ -426,6 +615,43 @@ impl App {
         };
     }
 
+    /// Load the Trade ticket from explicit fields (the desktop has no form
+    /// state). Mirrors the TUI form; clears any cached quote so the next
+    /// preview/execute re-prices off a fresh book.
+    pub fn ui_set_trade(
+        &mut self,
+        symbol: String,
+        side: Side,
+        qty: i32,
+        otype: TradeOrderType,
+        price: f64,
+        tif: Tif,
+    ) {
+        self.trade.symbol = symbol.trim().to_uppercase();
+        self.trade.side = side;
+        self.trade.qty = qty.max(1);
+        self.trade.otype = otype;
+        self.trade.price = price.max(0.0);
+        self.trade.tif = tif;
+        self.trade.quote = None;
+    }
+
+    /// Preview the loaded Trade ticket (what-if) — same path as the TUI `p`.
+    pub async fn ui_trade_preview(&mut self, store: &Store) -> Result<()> {
+        self.preview_equity_order(store).await
+    }
+
+    /// Execute the loaded Trade ticket — the full guardrail stack (armed /
+    /// read_only / live-confirm / notional cap), same path as the TUI `x`.
+    pub async fn ui_trade_execute(&mut self, store: &Store) -> Result<()> {
+        self.execute_equity_order(store).await
+    }
+
+    /// Cancel a working order by id (the desktop's Orders cancel button).
+    pub async fn ui_cancel_order(&mut self, order_id: &str, store: &Store) -> Result<()> {
+        self.cancel_order_by_id(order_id, store).await
+    }
+
     /// Confirm live trading for this session by typing [`LIVE_CONFIRM_PHRASE`].
     pub fn ui_confirm_live(&mut self, phrase: &str) -> bool {
         if phrase.trim() == LIVE_CONFIRM_PHRASE {
@@ -441,7 +667,10 @@ impl App {
 
     /// Map a keypress to an [`Action`] (mode-aware).
     pub fn handle_key(&self, key: KeyEvent) -> Option<Action> {
-        if matches!(self.input, InputMode::AddSymbol(_) | InputMode::ConfirmLive(_)) {
+        if matches!(
+            self.input,
+            InputMode::AddSymbol(_) | InputMode::ConfirmLive(_) | InputMode::TradeSymbol(_)
+        ) {
             return match key.code {
                 KeyCode::Enter => Some(Action::SubmitInput),
                 KeyCode::Esc => Some(Action::CancelInput),
@@ -487,12 +716,33 @@ impl App {
             }
         }
 
+        // The Trade tab is a form: j/k move field focus, h/l adjust the focused
+        // field, Enter edits the symbol. Unmatched keys fall through so the global
+        // bindings (Tab switch, `p`/`x`/`A`, `r`, `q`) still work.
+        if self.tab == Tab::Trade {
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => return Some(Action::TradeField(1)),
+                KeyCode::Up | KeyCode::Char('k') => return Some(Action::TradeField(-1)),
+                KeyCode::Left | KeyCode::Char('h') => return Some(Action::TradeAdjust(-1)),
+                KeyCode::Right | KeyCode::Char('l') => return Some(Action::TradeAdjust(1)),
+                KeyCode::Enter => return Some(Action::TradeEditSymbol),
+                _ => {}
+            }
+        }
+
+        // On the Orders tab, `d`/`c` cancels the selected working order.
+        if self.tab == Tab::Orders && matches!(key.code, KeyCode::Char('d' | 'c'))
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            return Some(Action::CancelOrder);
+        }
+
         match key.code {
             KeyCode::Char('q') => Some(Action::Quit),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(Action::Quit),
             KeyCode::Tab | KeyCode::Right => Some(Action::NextTab),
             KeyCode::BackTab | KeyCode::Left => Some(Action::PrevTab),
-            KeyCode::Char(d @ '1'..='8') => Some(Action::JumpTab(d as usize - '1' as usize)),
+            KeyCode::Char(d @ '1'..='9') => Some(Action::JumpTab(d as usize - '1' as usize)),
             KeyCode::Char('j') | KeyCode::Down => Some(Action::Down),
             KeyCode::Char('k') | KeyCode::Up => Some(Action::Up),
             KeyCode::Char('a') => Some(Action::StartAddSymbol),
@@ -550,7 +800,9 @@ impl App {
                 }
             }
             Action::InputChar(c) => match &mut self.input {
-                InputMode::AddSymbol(buf) if c.is_ascii_alphanumeric() || c == '.' => {
+                InputMode::AddSymbol(buf) | InputMode::TradeSymbol(buf)
+                    if c.is_ascii_alphanumeric() || c == '.' =>
+                {
                     buf.push(c.to_ascii_uppercase());
                 }
                 InputMode::ConfirmLive(buf) if c.is_ascii_alphanumeric() => {
@@ -559,7 +811,9 @@ impl App {
                 _ => {}
             },
             Action::Backspace => match &mut self.input {
-                InputMode::AddSymbol(buf) | InputMode::ConfirmLive(buf) => {
+                InputMode::AddSymbol(buf)
+                | InputMode::ConfirmLive(buf)
+                | InputMode::TradeSymbol(buf) => {
                     buf.pop();
                 }
                 InputMode::Normal => {}
@@ -590,6 +844,16 @@ impl App {
                             );
                         }
                     }
+                    InputMode::TradeSymbol(buf) => {
+                        let sym = buf.trim().to_string();
+                        self.trade.symbol = sym.clone();
+                        self.trade.quote = None;
+                        if sym.is_empty() {
+                            self.status = "symbol cleared".into();
+                        } else {
+                            self.fetch_trade_quote().await;
+                        }
+                    }
                     InputMode::Normal => {}
                 }
             }
@@ -616,12 +880,16 @@ impl App {
                 };
             }
             Action::Preview => {
-                if let Some(sug) = self.selected_suggestion().cloned() {
+                if self.tab == Tab::Trade {
+                    self.preview_equity_order(store).await?;
+                } else if let Some(sug) = self.selected_suggestion().cloned() {
                     self.preview_suggestion(&sug, store).await?;
                 }
             }
             Action::Execute => {
-                if let Some(sug) = self.selected_suggestion().cloned() {
+                if self.tab == Tab::Trade {
+                    self.execute_equity_order(store).await?;
+                } else if let Some(sug) = self.selected_suggestion().cloned() {
                     self.execute_suggestion(&sug, store).await?;
                 }
             }
@@ -640,6 +908,16 @@ impl App {
             Action::ToggleAutomate => self.toggle_slot_automate(store).await,
             Action::SlotRisk(dir) => self.adjust_slot_risk(dir, store).await,
             Action::SlotProfit(dir) => self.adjust_slot_profit(dir, store).await,
+            Action::TradeField(delta) => {
+                self.trade.field = self.trade.field.cycle(delta);
+            }
+            Action::TradeAdjust(delta) => self.adjust_trade_field(delta),
+            Action::TradeEditSymbol => {
+                self.trade.field = TradeField::Symbol;
+                self.input = InputMode::TradeSymbol(self.trade.symbol.clone());
+                self.status = "type a ticker, Enter to fetch its quote, Esc to cancel".into();
+            }
+            Action::CancelOrder => self.cancel_selected_order(store).await?,
             Action::ToggleSettingEdit => {
                 self.settings_editing = !self.settings_editing;
                 self.status = if self.settings_editing {
@@ -1954,6 +2232,284 @@ impl App {
         Ok(())
     }
 
+    // --- Trade tab: manual equity/ETF order ticket ------------------------
+
+    /// Fetch a fresh two-sided quote for the ticket's symbol (no-op offline).
+    /// Drives both the panel display and marketable-limit pricing.
+    async fn fetch_trade_quote(&mut self) {
+        let sym = self.trade.symbol.trim().to_uppercase();
+        if sym.is_empty() {
+            self.trade.quote = None;
+            return;
+        }
+        let Some(ibkr) = self.ibkr.clone() else {
+            self.status = "offline — connect to fetch a live quote".into();
+            return;
+        };
+        match ibkr.equity_quote(&sym).await {
+            Ok(s) => {
+                self.trade.quote = Some(EquityQuote { bid: s.bid, ask: s.ask, last: s.last });
+                self.status = format!(
+                    "{sym}: bid {} · ask {} · last {}",
+                    fmt_price_opt(s.bid),
+                    fmt_price_opt(s.ask),
+                    fmt_price_opt(s.last)
+                );
+            }
+            Err(e) => {
+                self.trade.quote = None;
+                self.status = format!("{sym} quote failed: {e}");
+            }
+        }
+    }
+
+    /// Adjust the focused Trade-ticket field by `delta` steps (h/l).
+    fn adjust_trade_field(&mut self, delta: i32) {
+        match self.trade.field {
+            // The symbol is edited via Enter (text entry), not h/l.
+            TradeField::Symbol => {}
+            TradeField::Side => {
+                self.trade.side = match self.trade.side {
+                    Side::Buy => Side::Sell,
+                    Side::Sell => Side::Buy,
+                };
+            }
+            TradeField::Qty => {
+                self.trade.qty = (self.trade.qty + delta).max(1);
+            }
+            TradeField::Type => {
+                self.trade.otype = self.trade.otype.cycle(delta);
+            }
+            TradeField::Price => {
+                // Step by a nickel for usable manual pricing; floor at 0, round to cent.
+                let stepped = (self.trade.price + 0.05 * delta as f64).max(0.0);
+                self.trade.price = (stepped * 100.0).round() / 100.0;
+            }
+            TradeField::Tif => {
+                self.trade.tif = match self.trade.tif {
+                    Tif::Day => Tif::Gtc,
+                    Tif::Gtc => Tif::Day,
+                };
+            }
+        }
+    }
+
+    /// Best estimate of the per-share price for sizing/notional checks: the typed
+    /// price if set, else the quote's mid → ask → last.
+    fn estimate_trade_price(&self) -> Option<f64> {
+        if self.trade.price > 0.0 {
+            return Some(self.trade.price);
+        }
+        self.trade.quote.and_then(|q| q.mid().or(q.ask).or(q.last))
+    }
+
+    /// Resolve the form's order type into a concrete [`EquityOrderKind`], or an
+    /// error message naming what's missing. Returns Copy parts only (no borrow of
+    /// `self`) so the caller can own the symbol string while transmitting.
+    fn build_equity_kind(&self) -> Result<EquityOrderKind, String> {
+        let tick = 0.01_f64;
+        match self.trade.otype {
+            TradeOrderType::Marketable => {
+                let q = self.trade.quote.ok_or("no quote — press Enter on Symbol to fetch")?;
+                let (Some(bid), Some(ask)) = (q.bid, q.ask) else {
+                    return Err("quote has no bid/ask — refetch, or use Limit".into());
+                };
+                let px = marketable_limit(self.trade.side, bid, ask, tick, self.trade.slack_ticks)
+                    .ok_or("unusable quote (crossed/locked/too wide) — refusing to submit")?;
+                Ok(EquityOrderKind::Limit(px))
+            }
+            TradeOrderType::Limit => {
+                if self.trade.price <= 0.0 {
+                    return Err("set a limit price (focus Price, then h/l)".into());
+                }
+                Ok(EquityOrderKind::Limit(self.trade.price))
+            }
+            TradeOrderType::MidPrice => {
+                let cap = (self.trade.price > 0.0).then_some(self.trade.price);
+                Ok(EquityOrderKind::MidPrice(cap))
+            }
+            TradeOrderType::Market => Ok(EquityOrderKind::Market),
+            TradeOrderType::Adaptive => {
+                let base = if self.trade.price > 0.0 {
+                    self.trade.price
+                } else {
+                    self.trade
+                        .quote
+                        .and_then(|q| q.mid())
+                        .ok_or("Adaptive needs a price — type one or fetch a quote")?
+                };
+                Ok(EquityOrderKind::Adaptive { limit: base, priority: AdaptivePriority::Normal })
+            }
+        }
+    }
+
+    /// Preview the current Trade ticket (what-if, never transmits).
+    async fn preview_equity_order(&mut self, store: &Store) -> Result<()> {
+        self.route_equity_order(true, store).await
+    }
+
+    /// Transmit the current Trade ticket. Enforces the same gate as the wheel —
+    /// armed, not read_only, live-confirmed — plus the equity notional cap, and
+    /// auto-disarms on a successful submit.
+    async fn execute_equity_order(&mut self, store: &Store) -> Result<()> {
+        if !self.armed {
+            self.status = "disarmed — press `A` to arm before executing".into();
+            return Ok(());
+        }
+        if self.cfg.guardrails.read_only {
+            self.status = "read_only = true in config — disable to transmit".into();
+            return Ok(());
+        }
+        if self.trade.qty <= 0 {
+            self.status = "quantity must be > 0".into();
+            return Ok(());
+        }
+        if !self.live_gate_ok() {
+            self.status = format!(
+                "LIVE not confirmed — press `L` and type {LIVE_CONFIRM_PHRASE} to unlock real-money orders this session"
+            );
+            return Ok(());
+        }
+        // Notional cap (fat-finger guard). Require a price estimate so a live
+        // equity order is never sized blind.
+        match self.estimate_trade_price() {
+            Some(px) => {
+                let notional = px * self.trade.qty as f64;
+                if notional > self.cfg.guardrails.max_order_notional {
+                    self.status = format!(
+                        "blocked: order notional ${:.0} exceeds max_order_notional ${:.0}",
+                        notional, self.cfg.guardrails.max_order_notional
+                    );
+                    return Ok(());
+                }
+            }
+            None => {
+                self.status =
+                    "fetch a quote first (Enter on Symbol) so the order can be size-checked".into();
+                return Ok(());
+            }
+        }
+        self.route_equity_order(false, store).await
+    }
+
+    /// Shared preview/transmit tail for the Trade ticket, journaling the outcome.
+    /// Book-priced types refetch the quote first so the marketable price is current.
+    async fn route_equity_order(&mut self, preview: bool, store: &Store) -> Result<()> {
+        let Some(ibkr) = self.ibkr.clone() else {
+            self.status = "not connected — start IB Gateway first".into();
+            return Ok(());
+        };
+        let symbol = self.trade.symbol.trim().to_uppercase();
+        if symbol.is_empty() {
+            self.status = "no symbol — press Enter on the Symbol field".into();
+            return Ok(());
+        }
+        if matches!(
+            self.trade.otype,
+            TradeOrderType::Marketable | TradeOrderType::Adaptive | TradeOrderType::MidPrice
+        ) {
+            self.fetch_trade_quote().await;
+        }
+        let kind = match self.build_equity_kind() {
+            Ok(k) => k,
+            Err(e) => {
+                self.status = e;
+                return Ok(());
+            }
+        };
+        let (side, qty, tif) = (self.trade.side, self.trade.qty, self.trade.tif);
+        let order = EquityOrder { symbol: &symbol, side, quantity: qty, kind, tif };
+        let label = order.to_string();
+        let limit_for_journal = match kind {
+            EquityOrderKind::Limit(p) => Some(p),
+            EquityOrderKind::Adaptive { limit, .. } => Some(limit),
+            EquityOrderKind::MidPrice(c) => c,
+            EquityOrderKind::Market => None,
+        };
+        let entry_base = NewJournalEntry {
+            symbol: symbol.clone(),
+            action: format!("equity {side}"),
+            quantity: qty as i64,
+            limit_price: limit_for_journal,
+            note: Some(label.clone()),
+            ..Default::default()
+        };
+        match ibkr.submit_or_preview_equity(&order, preview).await {
+            Ok(OrderOutcome::Preview(state)) => {
+                let (margin, commission) = preview_margin_commission(&state);
+                self.status = format!(
+                    "preview {label}: margin {margin} · commission {commission} · {}",
+                    state.status
+                );
+                store
+                    .record(&NewJournalEntry {
+                        status: journal_status::PREVIEWED.into(),
+                        ..entry_base
+                    })
+                    .await?;
+            }
+            Ok(OrderOutcome::Submitted(oid)) => {
+                self.status = format!("submitted {label} → id {oid}");
+                store
+                    .record(&NewJournalEntry {
+                        status: journal_status::SUBMITTED.into(),
+                        ibkr_order_id: Some(oid),
+                        ..entry_base
+                    })
+                    .await?;
+                // Safety: a successful transmit auto-disarms.
+                self.armed = false;
+            }
+            Err(e) => {
+                self.status =
+                    format!("{} error: {e}", if preview { "preview" } else { "execute" });
+                store
+                    .record(&NewJournalEntry {
+                        status: journal_status::REJECTED.into(),
+                        note: Some(e.to_string()),
+                        ..entry_base
+                    })
+                    .await?;
+            }
+        }
+        self.journal = store.recent_journal(200).await?;
+        Ok(())
+    }
+
+    /// Cancel the working order selected on the Orders tab (delegates to
+    /// [`Self::cancel_order_by_id`]).
+    async fn cancel_selected_order(&mut self, store: &Store) -> Result<()> {
+        let Some(ord) = self.open_orders.get(self.selected).cloned() else {
+            self.status = "no working order selected".into();
+            return Ok(());
+        };
+        self.cancel_order_by_id(&ord.order_id, store).await
+    }
+
+    /// Cancel a working order by id. Refused under `read_only`; the terminal
+    /// status lands on the order-activity stream, and a reload refreshes the list.
+    /// Shared by the TUI Orders tab and the desktop's cancel command.
+    async fn cancel_order_by_id(&mut self, order_id: &str, store: &Store) -> Result<()> {
+        if self.cfg.guardrails.read_only {
+            self.status = "read_only = true in config — cancels disabled".into();
+            return Ok(());
+        }
+        let Some(ibkr) = self.ibkr.clone() else {
+            self.status = "not connected — start IB Gateway first".into();
+            return Ok(());
+        };
+        match ibkr.cancel_order(order_id).await {
+            Ok(()) => {
+                self.status = format!("cancel sent for order {order_id}");
+                self.request_reload(store).await;
+            }
+            Err(e) => {
+                self.status = format!("cancel {order_id} failed: {e}");
+            }
+        }
+        Ok(())
+    }
+
     fn switch_tab(&mut self, delta: isize) {
         let n = Tab::ALL.len() as isize;
         let i = (self.tab.index() as isize + delta).rem_euclid(n) as usize;
@@ -2146,6 +2702,13 @@ impl App {
                 self.reconcile_pending_rolls(open, &bp, store).await;
                 self.reconcile_zerodte_positions(open, &bp, store).await;
             }
+            // Working orders + live portfolio for their tabs. `None` = "unknown"
+            // (a failed snapshot) — keep the `_ok` flag false so the view says so
+            // rather than rendering an empty (misleading) list.
+            self.open_orders_ok = d.open_orders.is_some();
+            self.open_orders = d.open_orders.unwrap_or_default();
+            self.portfolio_ok = d.portfolio.is_some();
+            self.portfolio = d.portfolio.unwrap_or_default();
             // Keep any roll status the reconcile just set; otherwise settle to the
             // default connected status.
             if !self.status.starts_with("roll ") {
@@ -2155,6 +2718,10 @@ impl App {
             self.suggestions.clear();
             self.hedged_suggestions.clear();
             self.zerodte_suggestions.clear();
+            self.open_orders.clear();
+            self.open_orders_ok = false;
+            self.portfolio.clear();
+            self.portfolio_ok = false;
             self.status = "broker positions unavailable — suggestions cleared until refresh".into();
         }
         self.positions = d.positions;
@@ -2419,6 +2986,11 @@ fn roll_leg_journal(
 /// Format a what-if preview's margin and commission for the status bar, as
 /// `(margin, commission)` with `"?"` where the broker omitted a value. One source
 /// for the formatting the single-leg / spread / structure preview paths share.
+/// Format an optional price for the Trade panel/status (`—` when absent).
+pub(super) fn fmt_price_opt(p: Option<f64>) -> String {
+    p.map(|v| format!("{v:.2}")).unwrap_or_else(|| "—".into())
+}
+
 fn preview_margin_commission(state: &OrderState) -> (String, String) {
     let margin = state
         .initial_margin_after
@@ -3057,4 +3629,72 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn trade_marketable_needs_a_quote_then_crosses_the_spread() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut app = offline_app(&store).await;
+        app.trade.symbol = "AAPL".into();
+        app.trade.otype = TradeOrderType::Marketable;
+        // No quote yet → refuse to build (never silently a market order).
+        assert!(app.build_equity_kind().is_err());
+        // With a quote, a buy crosses to the ask (+1 tick slack default).
+        app.trade.quote = Some(EquityQuote { bid: Some(150.00), ask: Some(150.10), last: Some(150.05) });
+        match app.build_equity_kind().unwrap() {
+            EquityOrderKind::Limit(px) => assert!((px - 150.11).abs() < 1e-6, "got {px}"),
+            other => panic!("expected Limit, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn trade_limit_requires_a_price() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut app = offline_app(&store).await;
+        app.trade.symbol = "AAPL".into();
+        app.trade.otype = TradeOrderType::Limit;
+        assert!(app.build_equity_kind().is_err(), "no price set");
+        app.trade.price = 149.50;
+        assert!(matches!(app.build_equity_kind(), Ok(EquityOrderKind::Limit(p)) if (p - 149.50).abs() < 1e-9));
+    }
+
+    #[tokio::test]
+    async fn trade_field_adjust_toggles_and_floors() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut app = offline_app(&store).await;
+        app.trade.field = TradeField::Side;
+        app.adjust_trade_field(1);
+        assert_eq!(app.trade.side, Side::Sell);
+        // Quantity never drops below 1.
+        app.trade.field = TradeField::Qty;
+        app.trade.qty = 1;
+        app.adjust_trade_field(-5);
+        assert_eq!(app.trade.qty, 1);
+        app.adjust_trade_field(3);
+        assert_eq!(app.trade.qty, 4);
+        // Order type cycles through all five choices.
+        app.trade.field = TradeField::Type;
+        app.trade.otype = TradeOrderType::Marketable;
+        app.adjust_trade_field(-1);
+        assert_eq!(app.trade.otype, TradeOrderType::Adaptive);
+    }
+
+    #[tokio::test]
+    async fn equity_execute_blocked_when_read_only() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut app = offline_app(&store).await;
+        app.armed = true;
+        app.cfg.guardrails.read_only = true;
+        app.trade.symbol = "AAPL".into();
+        app.execute_equity_order(&store).await.unwrap();
+        assert!(app.status.contains("read_only"), "status: {}", app.status);
+    }
+
+    #[tokio::test]
+    async fn equity_execute_blocked_when_disarmed() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut app = offline_app(&store).await;
+        app.armed = false;
+        app.trade.symbol = "AAPL".into();
+        app.execute_equity_order(&store).await.unwrap();
+        assert!(app.status.contains("disarmed"), "status: {}", app.status);
+    }
 }

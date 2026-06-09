@@ -3,7 +3,8 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, Tabs, Wrap};
 
-use super::app::{App, InputMode, Tab};
+use super::app::{fmt_price_opt, App, InputMode, Tab, TradeField, TradeOrderType};
+use crate::ibkr::{marketable_limit, Tif};
 use crate::engine::math::short_put_pnl_at;
 use crate::engine::structures;
 use crate::engine::types::{ActionKind, LegSide, Right, StructureKind, StructureLeg, Suggestion};
@@ -23,6 +24,9 @@ pub fn render(frame: &mut Frame, app: &App) {
         Tab::Suggestions => render_suggestions(frame, app, mid),
         Tab::HedgedWheel => render_hedged_suggestions(frame, app, mid),
         Tab::ZeroDte => render_zerodte(frame, app, mid),
+        Tab::Trade => render_trade(frame, app, mid),
+        Tab::Orders => render_orders(frame, app, mid),
+        Tab::Portfolio => render_portfolio(frame, app, mid),
         Tab::Journal => render_journal(frame, app, mid),
         Tab::Settings => render_settings(frame, app, mid),
         Tab::Help => render_help(frame, mid),
@@ -73,6 +77,7 @@ fn render_tabs(frame: &mut Frame, app: &App, area: Rect) {
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     let text = match &app.input {
         InputMode::AddSymbol(buf) => format!(" add symbol: {buf}_ "),
+        InputMode::TradeSymbol(buf) => format!(" trade symbol: {buf}_   (Enter fetches quote, Esc cancels) "),
         InputMode::ConfirmLive(buf) => {
             format!(" confirm LIVE: {buf}_   (type {} then Enter, Esc cancels) ", super::app::LIVE_CONFIRM_PHRASE)
         }
@@ -936,7 +941,7 @@ fn render_journal(frame: &mut Frame, app: &App, area: Rect) {
 fn render_help(frame: &mut Frame, area: Rect) {
     let lines = vec![
         Line::from(Span::styled("Navigation", HEAD)),
-        Line::from("  Tab / → / ←      switch tabs        1–8   jump to tab"),
+        Line::from("  Tab / → / ←      switch tabs        1–9   jump to tab"),
         Line::from("  j / k  or ↑ / ↓  move selection"),
         Line::from(""),
         Line::from(Span::styled("Settings tab", HEAD)),
@@ -945,6 +950,14 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from(Span::styled("Watchlist", HEAD)),
         Line::from("  a                add a symbol (type ticker, Enter)"),
         Line::from("  d                delete selected symbol"),
+        Line::from(""),
+        Line::from(Span::styled("Trade tab (manual equity ticket)", HEAD)),
+        Line::from("  j / k            move between fields    h / l   change focused field"),
+        Line::from("  Enter            edit symbol (type ticker, Enter fetches its quote)"),
+        Line::from("  p / A / x        preview · arm · execute (same gate as below)"),
+        Line::from(""),
+        Line::from(Span::styled("Orders tab", HEAD)),
+        Line::from("  d / c            cancel the selected working order"),
         Line::from(""),
         Line::from(Span::styled("Trading (Suggestions tab)", HEAD)),
         Line::from("  p                preview (what-if): margin / commission, no transmit"),
@@ -1067,4 +1080,201 @@ fn styled_row<'a>(cells: Vec<String>, selected: bool) -> Row<'a> {
 
 fn money(v: Option<f64>) -> String {
     v.map(|x| format!("${x:.0}")).unwrap_or_else(|| "—".into())
+}
+
+/// The Trade tab: a manual equity/ETF order ticket. A form (not a list) — the
+/// focused field is marked and changed with h/l; Enter edits the symbol.
+fn render_trade(frame: &mut Frame, app: &App, area: Rect) {
+    let t = &app.trade;
+
+    // One labelled, optionally-highlighted form row.
+    let field_row = |f: TradeField, label: &str, value: String| -> Line<'static> {
+        let active = t.field == f;
+        let marker = if active { "▶ " } else { "  " };
+        let lbl_style = if active { SEL.add_modifier(Modifier::BOLD) } else { HEAD };
+        Line::from(vec![Span::styled(format!("{marker}{label:<10}"), lbl_style), Span::raw(value)])
+    };
+
+    let symbol = if t.symbol.is_empty() { "—".to_string() } else { t.symbol.clone() };
+    let uses_price =
+        matches!(t.otype, TradeOrderType::Limit | TradeOrderType::MidPrice | TradeOrderType::Adaptive);
+    let price_val = if !uses_price {
+        "(from live book)".to_string()
+    } else if t.price > 0.0 {
+        let tag = if t.otype == TradeOrderType::MidPrice { " (cap)" } else { "" };
+        format!("{:.2}{tag}", t.price)
+    } else if t.otype == TradeOrderType::MidPrice {
+        "(no cap)".to_string()
+    } else {
+        "(unset — h/l to set)".to_string()
+    };
+    let tif = match t.tif {
+        Tif::Day => "DAY",
+        Tif::Gtc => "GTC",
+    };
+
+    let quote_line = match t.quote {
+        Some(q) => Line::from(vec![
+            Span::styled("  Quote     ", HEAD),
+            Span::raw(format!(
+                "bid {}  ask {}  last {}",
+                fmt_price_opt(q.bid),
+                fmt_price_opt(q.ask),
+                fmt_price_opt(q.last)
+            )),
+        ]),
+        None => Line::from(vec![
+            Span::styled("  Quote     ", HEAD),
+            Span::styled(
+                "none — press Enter on Symbol to fetch",
+                Style::new().fg(Color::DarkGray),
+            ),
+        ]),
+    };
+
+    // Estimated per-share price + notional (mirrors the execute-time size check).
+    let marketable = if t.otype == TradeOrderType::Marketable {
+        t.quote.and_then(|q| match (q.bid, q.ask) {
+            (Some(b), Some(a)) => marketable_limit(t.side, b, a, 0.01, t.slack_ticks),
+            _ => None,
+        })
+    } else {
+        None
+    };
+    let est = if t.price > 0.0 {
+        Some(t.price)
+    } else {
+        t.quote.and_then(|q| q.mid().or(q.ask).or(q.last))
+    };
+    let cap = app.cfg.guardrails.max_order_notional;
+    let summary = match marketable.or(est) {
+        Some(px) => format!(
+            "≈ {:.2}/sh   ·   notional ≈ ${:.0}   ·   cap ${:.0}",
+            px,
+            px * t.qty as f64,
+            cap
+        ),
+        None => format!("notional unknown — fetch a quote   ·   cap ${cap:.0}"),
+    };
+
+    let armed = if app.armed {
+        Span::styled(
+            "ARMED — `x` transmits a LIVE order",
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled("disarmed (`A` to arm)", Style::new().fg(Color::DarkGray))
+    };
+
+    let lines = vec![
+        field_row(TradeField::Symbol, "Symbol", symbol),
+        quote_line,
+        field_row(TradeField::Side, "Side", t.side.to_string()),
+        field_row(TradeField::Qty, "Quantity", t.qty.to_string()),
+        field_row(TradeField::Type, "Type", t.otype.label().to_string()),
+        field_row(TradeField::Price, "Price", price_val),
+        field_row(TradeField::Tif, "TIF", tif.to_string()),
+        Line::from(""),
+        Line::from(vec![Span::styled("  Est.      ", HEAD), Span::raw(summary)]),
+        Line::from(vec![Span::raw("  "), armed]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  j/k field · h/l change · Enter edit symbol · p preview · A arm · x execute",
+            Style::new().fg(Color::DarkGray),
+        )),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(" Trade — manual equity / ETF order ")),
+        area,
+    );
+}
+
+/// The Orders tab: live working orders, `d`/`c` cancels the selected one.
+fn render_orders(frame: &mut Frame, app: &App, area: Rect) {
+    let header =
+        Row::new(["Id", "Symbol", "Side", "Qty", "Type", "Limit", "Status", "Filled"]).style(HEAD);
+    let rows = app.open_orders.iter().enumerate().map(|(i, o)| {
+        let cells = vec![
+            o.order_id.clone(),
+            o.symbol.clone(),
+            o.action.clone(),
+            format!("{:.0}", o.quantity),
+            o.order_type.clone(),
+            fmt_price_opt(o.limit_price),
+            o.status.clone(),
+            format!("{:.0}/{:.0}", o.filled, o.filled + o.remaining),
+        ];
+        styled_row(cells, app.tab == Tab::Orders && i == app.selected)
+    });
+    let widths = [
+        Constraint::Length(8),
+        Constraint::Length(8),
+        Constraint::Length(5),
+        Constraint::Length(6),
+        Constraint::Length(10),
+        Constraint::Length(9),
+        Constraint::Length(13),
+        Constraint::Min(7),
+    ];
+    let title = if !app.open_orders_ok {
+        if app.connected {
+            " Orders — UNKNOWN (last fetch failed; press r) ".to_string()
+        } else {
+            " Orders — offline ".to_string()
+        }
+    } else if app.open_orders.is_empty() {
+        " Orders — none working ".to_string()
+    } else {
+        format!(" Orders ({}) — d/c cancels selected ", app.open_orders.len())
+    };
+    frame.render_widget(
+        Table::new(rows, widths).header(header).block(Block::bordered().title(title)),
+        area,
+    );
+}
+
+/// The Portfolio tab: live positions with mark + unrealized/realized P&L.
+fn render_portfolio(frame: &mut Frame, app: &App, area: Rect) {
+    let header =
+        Row::new(["Symbol", "Type", "Qty", "Mark", "Value", "AvgCost", "Unrl P&L", "Real P&L"])
+            .style(HEAD);
+    let rows = app.portfolio.iter().enumerate().map(|(i, p)| {
+        let cells = vec![
+            p.symbol.clone(),
+            p.security_type.clone(),
+            format!("{:.0}", p.position),
+            format!("{:.2}", p.market_price),
+            format!("{:.0}", p.market_value),
+            format!("{:.2}", p.average_cost),
+            format!("{:+.0}", p.unrealized_pnl),
+            format!("{:+.0}", p.realized_pnl),
+        ];
+        styled_row(cells, app.tab == Tab::Portfolio && i == app.selected)
+    });
+    let widths = [
+        Constraint::Length(8),
+        Constraint::Length(8),
+        Constraint::Length(7),
+        Constraint::Length(9),
+        Constraint::Length(11),
+        Constraint::Length(9),
+        Constraint::Length(10),
+        Constraint::Min(9),
+    ];
+    let title = if !app.portfolio_ok {
+        if app.connected {
+            " Portfolio — UNKNOWN (last fetch failed; press r) ".to_string()
+        } else {
+            " Portfolio — offline ".to_string()
+        }
+    } else if app.portfolio.is_empty() {
+        " Portfolio — no open positions ".to_string()
+    } else {
+        format!(" Portfolio ({}) ", app.portfolio.len())
+    };
+    frame.render_widget(
+        Table::new(rows, widths).header(header).block(Block::bordered().title(title)),
+        area,
+    );
 }

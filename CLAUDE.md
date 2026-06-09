@@ -40,10 +40,16 @@ backs store tests.
   intraday, multi-leg). Surfaced on the **0DTE tab** (a 2×2 grid of roster slots).
 - `ibkr/` — **the SOLE `ibapi` boundary.** Owns the `ibapi::Client` and maps
   `ibapi` types into plain structs (`PositionRow`, `ChainMeta`, `SnapshotData`,
-  `OrderEvent`, …). Do not import `ibapi` anywhere else. Every streaming request
-  is bounded by a timeout. `submit_or_preview(order, preview)` is the single
-  order entry point so preview and live paths can't diverge (`preview=true` →
-  what-if `analyze()`; `false` → `submit()`).
+  `OrderEvent`, `OpenOrderInfo`, `PortfolioRow`, …). Do not import `ibapi`
+  anywhere else. Every streaming request is bounded by a timeout. There is one
+  `submit_or_preview*` entry per order shape so preview and live paths can't
+  diverge (`preview=true` → what-if `analyze()`; `false` → `submit()`):
+  `submit_or_preview` (single option), `_spread`/`_combo` (BAG), and
+  `submit_or_preview_equity` (manual stock/ETF — Limit/MidPrice/protected-Market/
+  Adaptive via `EquityOrderKind`). `marketable_limit()` is a pure helper that
+  crosses the live book to a capped price (returns `None` on an unusable quote —
+  never a silent market order). `account_portfolio()` (mark + unrealized P&L) and
+  the widened `open_orders_snapshot()` feed the Portfolio/Orders views.
 - `positions.rs` — **pure broker→wheel-state reconciliation.** Flattened
   holdings → `WheelState` + share lot + open short. No I/O; exhaustively tested
   (it's the safety net for the connection-only path).
@@ -60,14 +66,21 @@ backs store tests.
   `ui.rs` = **pure render function of `App`**, `mod.rs` = `tokio::select!` run
   loop (key events + broker order-event stream + redraw + a 30s 0DTE scheduler
   tick), `schedule.rs` = **pure** US/Eastern market-time + entry-timing helpers.
+  Beyond the strategy tabs there's a manual-trading surface: a **Trade** tab (an
+  equity/ETF order ticket — `TradeForm`, j/k field focus + h/l adjust, priced via
+  `marketable_limit`/MidPrice/Adaptive and run through the *same* preview→arm→
+  execute gate as suggestions), an **Orders** tab (live working orders, `d`/`c`
+  cancels the selected one), and a **Portfolio** tab (live positions + unrealized
+  P&L). Equity orders journal as `action = "equity BUY/SELL"`.
 - `config.rs` — TOML config (connection, engine tuning, guardrails); every field
   defaults, so a missing `config.toml` still runs. See `config.toml.example`.
 - `src-tauri/` + `dist/` — the **desktop app** (a separate `betterwheel-desktop`
   crate that path-deps the lib). `src-tauri/src/lib.rs` runs a background task that
   drives `data::gather` (or demo) and emits a cached snapshot; `dist/` is a
   build-free static frontend (vanilla JS over `window.__TAURI__`, inline-SVG payoff
-  charts). **Phase 1 is read-only** — no order transmit (the arm/execute flow stays
-  in the TUI; Phase 2 will extract a shared `Session` core for it). See the desktop
+  charts). The desktop **drives the same `App`** and transmits through its `ui_*`
+  facade (suggestions *and* the manual Trade ticket / Orders cancel) — so the
+  guardrail/arm/execute code is never reimplemented webview-side. See the desktop
   section below.
 
 Data flow when connected: `ibkr.positions()` → `positions::reconcile` → sync into
@@ -78,10 +91,12 @@ Data flow when connected: `ibkr.positions()` → `positions::reconcile` → sync
 - **Paper-first.** `connection.mode = "paper"` by default (port 4002).
 - **Transmit is a 3-step gate:** preview/what-if (`p`) → **arm** (`A` toggles
   `armed`) → execute (`x`). A successful live submit **auto-disarms**.
-- **Guardrails** (config, enforced in `app::execute_suggestion` regardless of
-  engine output): `read_only` blocks all transmits; `max_contracts_per_order`
-  caps order size; `max_total_deployed` caps total CSP collateral (split across
-  the active watchlist when sizing).
+- **Guardrails** (config, enforced in `app::execute_suggestion` /
+  `execute_equity_order` regardless of engine output): `read_only` blocks all
+  transmits; `max_contracts_per_order` caps option order size; `max_total_deployed`
+  caps total CSP collateral (split across the active watchlist when sizing);
+  `max_order_notional` caps a single manual equity ticket (price × shares — a live
+  equity order is refused until a quote is fetched so it's never sized blind).
 - `ibkr.positions()` returns `Err` on an **incomplete** snapshot (stream error /
   timeout before `PositionEnd`). Callers must treat that as "unknown", never as
   "account is empty" — a failed fetch must not wipe wheel state or surface stale
@@ -101,11 +116,14 @@ sibling `marie-lookapp`. Build-free static frontend (`dist/`, vanilla JS over
 `window.__TAURI__`, `withGlobalTauri`); strict CSP; payoff curves are inline SVG
 (no chart lib). The lib stays clean — all Tauri/webview deps live in `src-tauri/`.
 
-- **Phase 1 = read-only** (current): a background task connects to Gateway (or
-  falls back to demo data offline), runs `data::gather`, caches a `Snapshot`, and
-  emits it to the webview. **No order transmit** — the preview→arm→execute safety
-  flow stays in the TUI. Phase 2 will extract a `Session` core from `tui::app::App`
-  so the desktop can transmit through the *same* guardrailed code.
+- **Transmit via the `App` facade** (no separate "Session" core was needed): a
+  background task connects to Gateway (or falls back to demo data offline), runs
+  `data::gather`, caches a `Snapshot`, and emits it to the webview. Orders go
+  through `App`'s `ui_*` facade — `ui_preview`/`ui_execute` (suggestions, by
+  list+index), `ui_set_trade` + `ui_trade_preview`/`ui_trade_execute` (the manual
+  equity ticket), and `ui_cancel_order` — so the preview→arm→execute→live-confirm
+  guardrail code runs **once**, in `tui::app::App`, shared by both front-ends. The
+  webview only collects form fields; it reimplements no order logic.
 - **Auto-update** = `tauri-plugin-updater` (minisign, `native-tls` to dodge the
   cargo-xwin/`ring` cross-compile break). It checks `latest.json` on the
   **`betterwheel/betterwheel.github.io`** repo's GitHub Releases. The updater fetches

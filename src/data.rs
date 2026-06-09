@@ -16,7 +16,9 @@ use crate::engine::types::{
     UnderlyingQuote, WheelState,
 };
 use crate::engine::{self, structures, SymbolContext};
-use crate::ibkr::{AccountSnapshot, Ibkr, OpenOrderInfo, PositionRow, SnapshotData, Tradability};
+use crate::ibkr::{
+    AccountSnapshot, Ibkr, OpenOrderInfo, PortfolioRow, PositionRow, SnapshotData, Tradability,
+};
 use crate::positions;
 use crate::store::{JournalRow, Store, WatchlistRow, WheelPositionRow};
 
@@ -63,6 +65,10 @@ pub struct LiveData {
     pub zerodte_suggestions: Vec<Option<Suggestion>>,
     /// Authoritative open orders, or `None` if that snapshot failed.
     pub open_orders: Option<Vec<OpenOrderInfo>>,
+    /// Live per-position valuation (mark + P&L) for the Portfolio view, or `None`
+    /// if that snapshot failed/was unavailable. Like `open_orders`, `None` means
+    /// "unknown" — the view must not render it as an empty portfolio.
+    pub portfolio: Option<Vec<PortfolioRow>>,
     /// `false` when the positions snapshot was incomplete: the caller must NOT
     /// treat `broker_positions`/`suggestions` as authoritative (safety-critical —
     /// a failed fetch must never look like "the account is empty").
@@ -90,9 +96,16 @@ pub async fn gather(
     probe_unknown_tradability(ibkr, store, &watchlist, today).await;
     watchlist = store.list_watchlist().await.unwrap_or_default();
 
-    let (broker_positions, suggestions, hedged_suggestions, open_orders, positions_ok) = match ibkr.positions().await {
+    let (broker_positions, suggestions, hedged_suggestions, open_orders, portfolio, positions_ok) = match ibkr.positions().await {
         Ok(positions) => {
             sync_wheel_state(store, &positions).await;
+            // Live valuation for the Portfolio view, keyed off the account that
+            // holds these positions. Best-effort — a failure leaves it `None`
+            // ("unknown") rather than an empty portfolio.
+            let portfolio = match positions.first().map(|p| p.account.clone()) {
+                Some(acct) => ibkr.account_portfolio(&acct).await.ok(),
+                None => Some(Vec::new()),
+            };
             // Authoritative open orders pick which symbols to skip; on a failed
             // snapshot, fall back to the journal's "submitted" rows.
             let (open_orders, working) = match ibkr.open_orders_snapshot().await {
@@ -109,12 +122,12 @@ pub async fn gather(
             };
             let (suggestions, hedged_suggestions) =
                 live_suggestions(ibkr, store, &watchlist, &positions, &working, cfg, today).await;
-            (positions, suggestions, hedged_suggestions, open_orders, true)
+            (positions, suggestions, hedged_suggestions, open_orders, portfolio, true)
         }
         Err(e) => {
             // Positions unknown — keep stored state, drop suggestions downstream.
             tracing::warn!("positions fetch failed; suggestions will be cleared, stored state kept: {e}");
-            (Vec::new(), Vec::new(), Vec::new(), None, false)
+            (Vec::new(), Vec::new(), Vec::new(), None, None, false)
         }
     };
 
@@ -140,6 +153,7 @@ pub async fn gather(
         hedged_suggestions,
         zerodte_suggestions,
         open_orders,
+        portfolio,
         positions_ok,
     }
 }
