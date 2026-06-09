@@ -10,10 +10,13 @@
 # anonymously, so the repo MUST be public for auto-update to work (releases on a
 # private repo can't be downloaded without auth).
 #
-# Unlike marie-lookapp, BetterWheel uses no Accessibility/TCC permission, so the
-# macOS app does not need a stable codesign identity — Tauri's default ad-hoc
-# signature is fine (the updater only verifies the minisign signature). It is
-# NOT notarized: first install needs right-click → Open; self-updates are fine.
+# The macOS app is codesigned with a stable SELF-SIGNED identity ("BetterWheel
+# Signing" in the login keychain — one-time setup, see CLAUDE.md). BetterWheel
+# uses no Accessibility/TCC permission, so this ISN'T for permission stability
+# like marie-lookapp; it's because Tauri's default ad-hoc signature makes
+# Gatekeeper flag a quarantined download as "damaged" (Apple Silicon) instead of
+# the bypassable "unidentified developer" dialog. It is NOT notarized: first
+# install still needs right-click → Open; self-updates are fine.
 #
 # Usage:  scripts/release.sh ["release notes…"]
 #
@@ -25,6 +28,10 @@
 #   - gh logged in with push access to ${RELEASES_REPO}
 #   - makensis on PATH (NSIS installer); cargo-xwin + Windows rust targets
 #   - ~/.tauri/betterwheel-updater.key (updater signing key; pubkey in tauri.conf.json)
+#   - "BetterWheel Signing" self-signed code-signing cert in the login keychain
+#     (Keychain Access → Certificate Assistant → Create a Certificate → name it
+#     "BetterWheel Signing", type "Code Signing"; then set it to Always Trust for
+#     code signing). One-time; see CLAUDE.md (desktop section).
 #   - Authenticode is OPT-IN: SKIP_AUTHENTICODE=0 + the betterwheel-signing keychain
 #     item (see sign-windows.sh). Default leaves Windows binaries unsigned
 #     (SmartScreen warns; the updater itself only checks the minisign signature).
@@ -47,6 +54,15 @@ SETUP_EXE="${ROOT}/src-tauri/target/betterwheel-setup-${VERSION}.exe"
 
 [ -f "${UPDATER_KEY}" ] || { echo "error: updater key missing: ${UPDATER_KEY}" >&2; exit 1; }
 command -v makensis >/dev/null 2>&1 || { echo "error: makensis not on PATH (port/brew install nsis)" >&2; exit 1; }
+# Self-signed macOS identity must exist before the (long) Windows build, so fail
+# fast. No -v: the cert is an untrusted self-signed root, so it shows under
+# find-identity but NOT its -v (valid) subset — codesign signs with it anyway.
+MAC_SIGN_ID="BetterWheel Signing"
+security find-identity -p codesigning 2>/dev/null | grep -q "${MAC_SIGN_ID}" || {
+  echo "error: '${MAC_SIGN_ID}' code-signing identity not in keychain." >&2
+  echo "  Create it: scripts/create-macos-signing-cert.sh  (see CLAUDE.md)" >&2
+  exit 1
+}
 # The release/** CI (.github/workflows/release.yml) may have already created this
 # tag as an UNSIGNED prerelease. That's fine — we reuse it below (clobber its
 # assets with the signed ones and promote it to a full release). Only a tag that
@@ -90,8 +106,7 @@ echo ">> minisigning the Windows installer"
 SIG="$(cat "${SETUP_EXE}.sig")"
 
 # macOS: the bundler emits the .app, the .app.tar.gz the updater consumes, and
-# its .sig (minisigned because TAURI_SIGNING_PRIVATE_KEY is set). No TCC here,
-# so the default ad-hoc app signature is fine — no stable identity needed.
+# its .sig (minisigned because TAURI_SIGNING_PRIVATE_KEY is set).
 echo ">> building macOS bundle (app + updater artifact)"
 (cd "${ROOT}" && TAURI_SIGNING_PRIVATE_KEY="${UPDATER_KEY}" \
   TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" npx tauri build --bundles app)
@@ -99,6 +114,18 @@ BUNDLE_DIR="${ROOT}/src-tauri/target/release/bundle"
 MAC_APP="${BUNDLE_DIR}/macos/BetterWheel.app"
 MAC_TARGZ="${BUNDLE_DIR}/macos/BetterWheel.app.tar.gz"
 [ -f "${MAC_TARGZ}.sig" ] || { echo "error: updater artifact sig missing — is createUpdaterArtifacts on?" >&2; exit 1; }
+
+# Codesign with the stable self-signed "BetterWheel Signing" identity. Tauri's
+# default ad-hoc signature makes Gatekeeper flag a quarantined download as
+# "damaged" on Apple Silicon; a real (even self-signed) identity downgrades that
+# to the bypassable "unidentified developer" dialog. The bundler already tarred
+# the ad-hoc app, so re-create the updater artifact from the SIGNED app and
+# re-minisign it. This must happen before the .dmg is rolled (below) so the dmg
+# ships the signed app too.
+echo ">> codesigning macOS app (${MAC_SIGN_ID})"
+codesign --force --deep --sign "${MAC_SIGN_ID}" "${MAC_APP}"
+tar -czf "${MAC_TARGZ}" -C "${BUNDLE_DIR}/macos" "BetterWheel.app"
+(cd "${ROOT}" && npx tauri signer sign -f "${UPDATER_KEY}" --password "" "${MAC_TARGZ}")
 MAC_SIG="$(cat "${MAC_TARGZ}.sig")"
 
 # Roll the .dmg by hand (tauri's dmg bundler drives Finder via AppleScript and
