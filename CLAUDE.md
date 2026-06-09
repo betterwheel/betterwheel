@@ -107,11 +107,12 @@ sibling `marie-lookapp`. Build-free static frontend (`dist/`, vanilla JS over
   flow stays in the TUI. Phase 2 will extract a `Session` core from `tui::app::App`
   so the desktop can transmit through the *same* guardrailed code.
 - **Auto-update** = `tauri-plugin-updater` (minisign, `native-tls` to dodge the
-  cargo-xwin/`ring` cross-compile break). It checks `latest.json` on **this repo's**
-  GitHub Releases (`betterwheel/betterwheel.github.io`). The updater fetches anonymously,
-  so **the repo MUST be public** for auto-update to work — releases on a private repo
-  can't be downloaded without auth (the repo is public, so auto-update works). This repo
-  doubles as the landing site (`betterwheel.github.io`, served from the root `index.html`).
+  cargo-xwin/`ring` cross-compile break). It checks `latest.json` on the
+  **`betterwheel/betterwheel.github.io`** repo's GitHub Releases. The updater fetches
+  anonymously, so **that repo MUST be public** for auto-update to work — releases on a
+  private repo can't be downloaded without auth (it's public, so auto-update works).
+  That repo is the separate **landing site** (served from its root `index.html`) *and*
+  the release host; **this** `betterwheel` repo holds only the app code (TUI + desktop).
   `dist/update.js` drives check → download → `process.relaunch()`.
   macOS isn't notarized (right-click→Open first run) and uses no TCC permission, so
   the default ad-hoc signature is fine — the updater only verifies the **minisign**
