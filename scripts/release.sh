@@ -10,10 +10,11 @@
 # anonymously, so the repo MUST be public for auto-update to work (releases on a
 # private repo can't be downloaded without auth).
 #
-# Unlike marie-lookapp, BetterWheel uses no Accessibility/TCC permission, so the
-# macOS app does not need a stable codesign identity — Tauri's default ad-hoc
-# signature is fine (the updater only verifies the minisign signature). It is
-# NOT notarized: first install needs right-click → Open; self-updates are fine.
+# The macOS app is signed with the StarData Developer ID identity and (when
+# notarytool creds are exported) notarized, so a fresh install opens without the
+# right-click → Open dance. If that cert isn't in the keychain the build falls
+# back to an ad-hoc signature. The updater only ever verifies the minisign
+# signature, independent of Apple signing.
 #
 # Usage:  scripts/release.sh ["release notes…"]
 #
@@ -90,11 +91,26 @@ echo ">> minisigning the Windows installer"
 SIG="$(cat "${SETUP_EXE}.sig")"
 
 # macOS: the bundler emits the .app, the .app.tar.gz the updater consumes, and
-# its .sig (minisigned because TAURI_SIGNING_PRIVATE_KEY is set). No TCC here,
-# so the default ad-hoc app signature is fine — no stable identity needed.
-echo ">> building macOS bundle (app + updater artifact)"
+# its .sig (minisigned because TAURI_SIGNING_PRIVATE_KEY is set). The .app is
+# signed with the StarData Developer ID identity when it's in the keychain;
+# notarization additionally runs when APPLE_ID + APPLE_PASSWORD are exported
+# (APPLE_TEAM_ID defaults to REDACTED-TEAM-ID). Falls back to ad-hoc otherwise.
+MAC_SIGN_ENV=()
+DEVID="Developer ID Application: REDACTED-ORG (REDACTED-TEAM-ID)"
+if security find-identity -v -p codesigning 2>/dev/null | grep -qF "${DEVID}"; then
+  MAC_SIGN_ENV+=(APPLE_SIGNING_IDENTITY="${APPLE_SIGNING_IDENTITY:-${DEVID}}")
+  if [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_PASSWORD:-}" ]; then
+    MAC_SIGN_ENV+=(APPLE_ID="${APPLE_ID}" APPLE_PASSWORD="${APPLE_PASSWORD}" APPLE_TEAM_ID="${APPLE_TEAM_ID:-REDACTED-TEAM-ID}")
+    echo ">> building macOS bundle (Developer ID sign + notarize)"
+  else
+    echo ">> building macOS bundle (Developer ID sign; export APPLE_ID+APPLE_PASSWORD to also notarize)"
+  fi
+else
+  echo ">> building macOS bundle (ad-hoc — StarData Developer ID cert not in keychain)"
+fi
 (cd "${ROOT}" && TAURI_SIGNING_PRIVATE_KEY="${UPDATER_KEY}" \
-  TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" npx tauri build --bundles app)
+  TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" \
+  "${MAC_SIGN_ENV[@]}" npx tauri build --bundles app)
 BUNDLE_DIR="${ROOT}/src-tauri/target/release/bundle"
 MAC_APP="${BUNDLE_DIR}/macos/BetterWheel.app"
 MAC_TARGZ="${BUNDLE_DIR}/macos/BetterWheel.app.tar.gz"
