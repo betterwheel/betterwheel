@@ -60,9 +60,9 @@ jobs:
           path: ~/.cargo/bin/cargo-xwin
           key: cargo-xwin-bin-${{ runner.os }}-v1
 
-      - name: Install toolchain (cargo-xwin, NSIS, llvm-rc)
+      - name: Install toolchain (cargo-xwin, NSIS, llvm-rc, osslsigncode)
         run: |
-          brew install nsis llvm
+          brew install nsis llvm osslsigncode
           command -v cargo-xwin >/dev/null || cargo install --locked cargo-xwin
 
       - name: Setup Node + Tauri CLI
