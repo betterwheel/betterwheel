@@ -111,7 +111,13 @@ SIG="$(cat "${SETUP_EXE}.sig")"
 DEVID="${MACOS_SIGNING_IDENTITY:-}"
 MAC_SIGN_ENV=()
 NOTARIZE=0
-if [ -n "${DEVID}" ] && security find-identity -v -p codesigning 2>/dev/null | grep -qF "${DEVID}"; then
+# Sign whenever the identity NAME is configured — do NOT gate on `security
+# find-identity`. Its -v filter does an online OCSP check that flakes on CI, and
+# even without -v it depends on keychain search-list state; both intermittently
+# dropped our (imported) cert and silently fell back to ad-hoc. CI imports the
+# cert and makes its keychain the default; locally it's in the login keychain. A
+# genuinely missing cert now fails codesign loudly instead of shipping ad-hoc.
+if [ -n "${DEVID}" ]; then
   MAC_SIGN_ENV+=("APPLE_SIGNING_IDENTITY=${DEVID}")
   if [ -n "${APPLE_API_KEY_PATH:-}" ] && [ -n "${APPLE_API_ISSUER:-}" ] && [ -n "${APPLE_API_KEY_ID:-}" ]; then
     MAC_SIGN_ENV+=("APPLE_API_ISSUER=${APPLE_API_ISSUER}" "APPLE_API_KEY=${APPLE_API_KEY_ID}" "APPLE_API_KEY_PATH=${APPLE_API_KEY_PATH}")
@@ -127,31 +133,43 @@ if [ -n "${DEVID}" ] && security find-identity -v -p codesigning 2>/dev/null | g
 else
   echo ">> WARNING: signing identity not in keychain — building AD-HOC (Gatekeeper will warn)" >&2
 fi
-# `env` is required: the MAC_SIGN_ENV array holds VAR=value strings, and bash
-# only treats VAR=value as an assignment when it's a literal at parse time — an
-# array element would instead be run as a command ("…: command not found").
+# `env` applies the VAR=value MAC_SIGN_ENV array as real assignments (not a
+# command); ${arr[@]+"${arr[@]}"} is bash-3.2-safe when the array is empty under
+# `set -u`.
 (cd "${ROOT}" && env TAURI_SIGNING_PRIVATE_KEY="${UPDATER_KEY}" \
   TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" \
-  "${MAC_SIGN_ENV[@]}" npx tauri build --bundles app)
+  ${MAC_SIGN_ENV[@]+"${MAC_SIGN_ENV[@]}"} npx tauri build --bundles app)
 BUNDLE_DIR="${ROOT}/src-tauri/target/release/bundle"
 MAC_APP="${BUNDLE_DIR}/macos/BetterWheel.app"
 MAC_TARGZ="${BUNDLE_DIR}/macos/BetterWheel.app.tar.gz"
 [ -f "${MAC_TARGZ}.sig" ] || { echo "error: updater artifact sig missing — is createUpdaterArtifacts on?" >&2; exit 1; }
 MAC_SIG="$(cat "${MAC_TARGZ}.sig")"
 
-# Roll the .dmg by hand (tauri's dmg bundler drives Finder via AppleScript and
-# fails in non-interactive shells), then notarize + staple it so the downloaded
-# image passes Gatekeeper offline (the .app inside is already notarized).
+# Build the STYLED .dmg with appdmg (writes the .DS_Store itself — background +
+# icon layout + /Applications drag target — with no AppleScript, so it survives
+# headless CI). Then notarize + staple.
 MAC_DMG="${BUNDLE_DIR}/macos/betterwheel-${VERSION}-macos-arm64.dmg"
-# Stage the .app next to an /Applications symlink so the mounted DMG offers a
-# drag-to-Applications target (the standard macOS install UX).
-DMG_STAGE="$(mktemp -d)"
-cp -R "${MAC_APP}" "${DMG_STAGE}/"
-ln -s /Applications "${DMG_STAGE}/Applications"
-hdiutil create -quiet -volname "BetterWheel" -srcfolder "${DMG_STAGE}" -ov -format UDZO "${MAC_DMG}"
-rm -rf "${DMG_STAGE}"
+APPDMG_SPEC="$(mktemp -t betterwheel-appdmg).json"
+cat > "${APPDMG_SPEC}" <<JSON
+{
+  "title": "BetterWheel",
+  "background": "${ROOT}/src-tauri/dmg/background.png",
+  "icon-size": 128,
+  "window": { "size": { "width": 660, "height": 440 } },
+  "contents": [
+    { "x": 165, "y": 220, "type": "file", "path": "${MAC_APP}" },
+    { "x": 495, "y": 220, "type": "link", "path": "/Applications" }
+  ]
+}
+JSON
+rm -f "${MAC_DMG}"
+(cd "${ROOT}" && npx --yes appdmg "${APPDMG_SPEC}" "${MAC_DMG}")
+rm -f "${APPDMG_SPEC}"
 if [ "${NOTARIZE}" = "1" ]; then
-  echo ">> notarizing + stapling the DMG"
+  echo ">> signing + notarizing + stapling the DMG"
+  # Sign the DMG itself (appdmg leaves it unsigned) so Gatekeeper has a usable
+  # signature; then notarize + staple. Order: sign -> notarize -> staple.
+  codesign --force --timestamp --sign "${DEVID}" "${MAC_DMG}"
   if [ -n "${APPLE_API_KEY_PATH:-}" ]; then
     xcrun notarytool submit "${MAC_DMG}" \
       --key "${APPLE_API_KEY_PATH}" --key-id "${APPLE_API_KEY_ID}" --issuer "${APPLE_API_ISSUER}" --wait
