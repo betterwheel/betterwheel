@@ -87,6 +87,9 @@ jobs:
           # Put our keychain first in the search list so codesign resolves the
           # Developer ID identity; keep the login keychain too.
           security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed s/\"//g)
+          # Make our keychain the DEFAULT too — codesign resolves the signing
+          # identity from the default keychain, not reliably from the search list.
+          security default-keychain -s "$KEYCHAIN"
           rm "$RUNNER_TEMP/cert.p12"
           security find-identity -v -p codesigning "$KEYCHAIN"
 

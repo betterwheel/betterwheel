@@ -111,7 +111,13 @@ SIG="$(cat "${SETUP_EXE}.sig")"
 DEVID="${MACOS_SIGNING_IDENTITY:-}"
 MAC_SIGN_ENV=()
 NOTARIZE=0
-if [ -n "${DEVID}" ] && security find-identity -v -p codesigning 2>/dev/null | grep -qF "${DEVID}"; then
+# Sign whenever the identity NAME is configured — do NOT gate on `security
+# find-identity`. Its -v filter does an online OCSP check that flakes on CI, and
+# even without -v it depends on keychain search-list state; both intermittently
+# dropped our (imported) cert and silently fell back to ad-hoc. CI imports the
+# cert and makes its keychain the default; locally it's in the login keychain. A
+# genuinely missing cert now fails codesign loudly instead of shipping ad-hoc.
+if [ -n "${DEVID}" ]; then
   MAC_SIGN_ENV+=("APPLE_SIGNING_IDENTITY=${DEVID}")
   if [ -n "${APPLE_API_KEY_PATH:-}" ] && [ -n "${APPLE_API_ISSUER:-}" ] && [ -n "${APPLE_API_KEY_ID:-}" ]; then
     MAC_SIGN_ENV+=("APPLE_API_ISSUER=${APPLE_API_ISSUER}" "APPLE_API_KEY=${APPLE_API_KEY_ID}" "APPLE_API_KEY_PATH=${APPLE_API_KEY_PATH}")
