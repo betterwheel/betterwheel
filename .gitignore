@@ -1,6 +1,16 @@
 # Build artifacts
 /target
 
+# macOS Finder cruft
+.DS_Store
+
+# Local Claude Code instructions — not part of the project
+CLAUDE.md
+.claude/
+
+# Local-only signing config for scripts/release.sh (real values; never commit)
+scripts/release.env
+
 # Secrets — NEVER commit these.
 # NOTE: .gitignore has no inline comments — text after a pattern on the same
 # line becomes part of the pattern, so keep comments on their own lines.

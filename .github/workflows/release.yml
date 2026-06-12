@@ -4,20 +4,16 @@ name: Build & publish unsigned releases
 # (universal: Intel + Apple Silicon lipo'd into one .app) — and publishes them as
 # a PRERELEASE GitHub Release on THIS repo (betterwheel/betterwheel).
 #
-# Trigger: a push to a release/** branch ONLY (e.g. release/0.2.0). Never runs on
-# main. These are convenience/test builds: unsigned, so Windows SmartScreen and
-# macOS Gatekeeper warn on first run, AND deliberately marked --prerelease so the
-# in-app updater (which reads releases/latest and skips prereleases) never serves
-# them. The SIGNED release plus the updater latest.json is produced separately by
-# scripts/release.sh, which reuses this tag: it clobbers these assets with signed
-# ones and promotes the prerelease to a full release.
+# Convenience/test builds only: unsigned, so Windows SmartScreen and macOS
+# Gatekeeper warn on first run, and marked --prerelease so the in-app updater
+# never serves them. MANUAL trigger (workflow_dispatch) on purpose: a push to
+# release/** now runs the SIGNED + notarized pipeline (release-signed.yml), so
+# this must not also fire on release/** or the two would race to publish the tag.
 #
 # No secrets: the built-in GITHUB_TOKEN (contents: write) publishes here.
 
 on:
-  push:
-    branches:
-      - 'release/**'
+  workflow_dispatch:
 
 env:
   # Run JS actions on Node 24 ahead of the default switch (silences the Node 20
