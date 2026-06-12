@@ -143,7 +143,13 @@ MAC_SIG="$(cat "${MAC_TARGZ}.sig")"
 # fails in non-interactive shells), then notarize + staple it so the downloaded
 # image passes Gatekeeper offline (the .app inside is already notarized).
 MAC_DMG="${BUNDLE_DIR}/macos/betterwheel-${VERSION}-macos-arm64.dmg"
-hdiutil create -quiet -volname "BetterWheel" -srcfolder "${MAC_APP}" -ov -format UDZO "${MAC_DMG}"
+# Stage the .app next to an /Applications symlink so the mounted DMG offers a
+# drag-to-Applications target (the standard macOS install UX).
+DMG_STAGE="$(mktemp -d)"
+cp -R "${MAC_APP}" "${DMG_STAGE}/"
+ln -s /Applications "${DMG_STAGE}/Applications"
+hdiutil create -quiet -volname "BetterWheel" -srcfolder "${DMG_STAGE}" -ov -format UDZO "${MAC_DMG}"
+rm -rf "${DMG_STAGE}"
 if [ "${NOTARIZE}" = "1" ]; then
   echo ">> notarizing + stapling the DMG"
   if [ -n "${APPLE_API_KEY_PATH:-}" ]; then
@@ -184,6 +190,7 @@ cp "${SETUP_EXE}" "${STAGE}/betterwheel-setup-${VERSION}.exe"
 cp "${X64_EXE}" "${STAGE}/betterwheel-windows-x64.exe"
 cp "${ARM64_EXE}" "${STAGE}/betterwheel-windows-arm64.exe"
 cp "${MAC_DMG}" "${STAGE}/betterwheel-${VERSION}-macos-arm64.dmg"
+cp "${MAC_DMG}" "${STAGE}/betterwheel-latest.dmg"   # stable, versionless link for salamacchine.it
 cp "${MAC_TARGZ}" "${STAGE}/betterwheel-macos-arm64.app.tar.gz"
 cp "${LATEST}" "${STAGE}/latest.json"
 
@@ -192,6 +199,7 @@ REL_ASSETS=(
   "${STAGE}/betterwheel-windows-x64.exe"
   "${STAGE}/betterwheel-windows-arm64.exe"
   "${STAGE}/betterwheel-${VERSION}-macos-arm64.dmg"
+  "${STAGE}/betterwheel-latest.dmg"
   "${STAGE}/betterwheel-macos-arm64.app.tar.gz"
   "${STAGE}/latest.json"
 )
